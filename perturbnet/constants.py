@@ -23,6 +23,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_first(names: tuple[str, ...], default: str) -> str:
     for name in names:
         raw = os.getenv(name)
@@ -90,6 +97,12 @@ LINF_COMPONENT_WEIGHT = _env_float("PERTURB_LINF_COMPONENT_WEIGHT", 0.7)
 RMSE_COMPONENT_WEIGHT = _env_float("PERTURB_RMSE_COMPONENT_WEIGHT", 0.3)
 MAX_CHALLENGE_ATTEMPTS = _env_int("PERTURB_MAX_CHALLENGE_ATTEMPTS", 12)
 MINER_EXPLORATION_RATIO = _env_float("PERTURB_MINER_EXPLORATION_RATIO", 0.20)
+WANDB_ENABLED = _env_bool("PERTURB_WANDB_ENABLED", False)
+WANDB_PROJECT = os.getenv("PERTURB_WANDB_PROJECT", "perturb-validator")
+WANDB_ENTITY = os.getenv("PERTURB_WANDB_ENTITY", "perturb-ai").strip()
+WANDB_RUN_NAME = os.getenv("PERTURB_WANDB_RUN_NAME", "").strip()
+WANDB_MODE = os.getenv("PERTURB_WANDB_MODE", "online").strip()
+WANDB_LOG_CONSOLE = _env_bool("PERTURB_WANDB_LOG_CONSOLE", True)
 
 VALIDATOR_CONFIG = {
     "image_endpoint": IMAGE_ENDPOINT,
@@ -114,6 +127,12 @@ VALIDATOR_CONFIG = {
     "rmse_component_weight": RMSE_COMPONENT_WEIGHT,
     "max_challenge_attempts": MAX_CHALLENGE_ATTEMPTS,
     "miner_exploration_ratio": MINER_EXPLORATION_RATIO,
+    "wandb_enabled": WANDB_ENABLED,
+    "wandb_project": WANDB_PROJECT,
+    "wandb_entity": WANDB_ENTITY,
+    "wandb_run_name": WANDB_RUN_NAME,
+    "wandb_mode": WANDB_MODE,
+    "wandb_log_console": WANDB_LOG_CONSOLE,
 }
 
 # Validator scoring defaults.
