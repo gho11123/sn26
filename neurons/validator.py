@@ -18,6 +18,10 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+try:
+    import wandb  # type: ignore[reportMissingImports]
+except Exception:  # pragma: no cover - optional dependency
+    wandb = None
 
 from perturbnet import constants as C
 from perturbnet.image_io import decode_image_b64
@@ -157,6 +161,32 @@ def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
     return 10.0 * math.log10(1.0 / mse)
 
 
+class _WandbConsoleHandler(pylogging.Handler):
+    def __init__(self, owner: "PerturbValidator") -> None:
+        super().__init__()
+        self.owner = owner
+
+    def emit(self, record: pylogging.LogRecord) -> None:
+        run = self.owner.wandb_run
+        if run is None:
+            return
+        if record.name.startswith("wandb"):
+            return
+        try:
+            run.log(
+                {
+                    "validator/console_level": record.levelname,
+                    "validator/console_logger": record.name,
+                    "validator/console_message": self.format(record),
+                    "validator/console_ts": float(record.created),
+                },
+                step=int(self.owner.step),
+            )
+        except Exception:
+            # Never let console-forwarding failures affect validator runtime.
+            pass
+
+
 class PerturbValidator:
     def __init__(self, config: bt.config) -> None:
         self.config = config
@@ -174,12 +204,15 @@ class PerturbValidator:
         self.step = 0
         self.last_weight_block = 0
         self.state_path = os.path.join(self.config.logging.logging_dir, C.VALIDATOR_STATE_FILENAME)
+        self.wandb_run: Any | None = None
+        self._wandb_console_handler: pylogging.Handler | None = None
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
         self.uid_hotkeys: list[str] = list(self.metagraph.hotkeys[: int(self.metagraph.n)])
 
         self._load_state()
+        self._init_wandb()
 
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
@@ -268,6 +301,79 @@ class PerturbValidator:
         }
         with open(self.state_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
+
+    def _init_wandb(self) -> None:
+        if not bool(getattr(self.config.perturb, "wandb_enabled", False)):
+            return
+        if wandb is None:
+            bt.logging.warning("PERTURB_WANDB_ENABLED is true, but `wandb` is not installed.")
+            return
+        try:
+            init_kwargs: dict[str, Any] = {
+                "project": str(getattr(self.config.perturb, "wandb_project", "perturb-validator")),
+                "config": {
+                    "netuid": int(self.config.netuid),
+                    "network": str(getattr(self.config.subtensor, "network", "unknown")),
+                    "k_miners": int(self.config.perturb.k_miners),
+                    "history_size": int(self.config.perturb.history_size),
+                    "min_processed_count": int(self.config.perturb.min_processed_count),
+                },
+            }
+            entity = str(getattr(self.config.perturb, "wandb_entity", "")).strip()
+            run_name = str(getattr(self.config.perturb, "wandb_run_name", "")).strip()
+            mode = str(getattr(self.config.perturb, "wandb_mode", "online")).strip() or "online"
+            if entity:
+                init_kwargs["entity"] = entity
+            if run_name:
+                init_kwargs["name"] = run_name
+            init_kwargs["mode"] = mode
+            self.wandb_run = wandb.init(**init_kwargs)
+            self._attach_wandb_console_handler()
+            bt.logging.info("W&B logging initialized for validator.")
+        except Exception as exc:
+            bt.logging.warning(f"Failed to initialize W&B logging: {exc}")
+            self.wandb_run = None
+
+    def _attach_wandb_console_handler(self) -> None:
+        if not bool(getattr(self.config.perturb, "wandb_log_console", True)):
+            return
+        if self._wandb_console_handler is not None:
+            return
+        handler = _WandbConsoleHandler(self)
+        handler.setLevel(pylogging.NOTSET)
+        handler.setFormatter(
+            pylogging.Formatter(
+                "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
+            )
+        )
+        pylogging.getLogger().addHandler(handler)
+        self._wandb_console_handler = handler
+
+    def _detach_wandb_console_handler(self) -> None:
+        if self._wandb_console_handler is None:
+            return
+        root_logger = pylogging.getLogger()
+        root_logger.removeHandler(self._wandb_console_handler)
+        self._wandb_console_handler = None
+
+    def _wandb_log(self, payload: dict[str, Any]) -> None:
+        if self.wandb_run is None:
+            return
+        try:
+            self.wandb_run.log(payload, step=int(self.step))
+        except Exception as exc:
+            bt.logging.warning(f"W&B log failed: {exc}")
+
+    def _finish_wandb(self) -> None:
+        self._detach_wandb_console_handler()
+        if self.wandb_run is None:
+            return
+        try:
+            self.wandb_run.finish()
+        except Exception as exc:
+            bt.logging.warning(f"W&B finish failed: {exc}")
+        finally:
+            self.wandb_run = None
 
     def _seed_from_block(self, block: int) -> int:
         digest = hashlib.sha256(f"{C.SUBNET_NAMESPACE}:{self.config.netuid}:{block}".encode("utf-8")).hexdigest()
@@ -818,6 +924,7 @@ class PerturbValidator:
                 responses = self._run_query_miners(miner_uids, challenge)
                 self._log_step_start("loop_score_responses", response_count=len(responses))
                 rewards: list[float] = []
+                results_by_uid: list[tuple[int, EvaluationResult]] = []
                 for uid, response in zip(miner_uids, responses):
                     status_code = getattr(response.dendrite, "status_code", 0) if response.dendrite else 0
                     process_time = getattr(response.dendrite, "process_time", None) if response.dendrite else None
@@ -837,6 +944,7 @@ class PerturbValidator:
                         )
                     score = float(result.score)
                     rewards.append(score)
+                    results_by_uid.append((uid, result))
                     bt.logging.info(
                         f"uid={uid} status={status_code} score={score:.6f} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
@@ -847,6 +955,7 @@ class PerturbValidator:
 
                 self._log_step_start("loop_update_histories")
                 self._update_histories(miner_uids, rewards)
+                
                 self._log_step_start("loop_save_state")
                 self._save_state()
 
@@ -867,6 +976,7 @@ class PerturbValidator:
                 time.sleep(5)
         if not self._query_loop.is_closed():
             self._query_loop.close()
+        self._finish_wandb()
 
 
 def build_config() -> bt.config:

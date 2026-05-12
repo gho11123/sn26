@@ -16,6 +16,7 @@ setup(
         "requests>=2.31.0",
         "fastapi>=0.111.0",
         "uvicorn>=0.30.0",
+        "wandb",
     ],
 )
 

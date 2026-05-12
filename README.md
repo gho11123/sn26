@@ -169,6 +169,9 @@ Important validator-specific fields:
 - `PERTURB_MIN_PROCESSED_COUNT`
 - `PERTURB_MIN_LINF_DELTA`
 - `PERTURB_MAX_LINF_DELTA`
+- `PERTURB_WANDB_ENABLED` (`true` to enable validator metrics logging to Weights & Biases)
+- `PERTURB_WANDB_PROJECT`, `PERTURB_WANDB_ENTITY`, `PERTURB_WANDB_RUN_NAME`, `PERTURB_WANDB_MODE`
+- `PERTURB_WANDB_LOG_CONSOLE` (`true` to forward validator console logs to W&B as well)
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
 
 ### 3) Start validator stack (llm_endpoint + validator)
