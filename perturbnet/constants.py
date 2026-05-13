@@ -23,6 +23,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _env_first(names: tuple[str, ...], default: str) -> str:
     for name in names:
         raw = os.getenv(name)
@@ -32,7 +39,7 @@ def _env_first(names: tuple[str, ...], default: str) -> str:
 
 # Shared subnet identity/constants.
 SUBNET_NAMESPACE = "perturb"
-MODEL_NAME = "EfficientNet-B5"
+MODEL_NAME = "EfficientNetV2-M"
 PROMPTS = (
     "dog",
     "cat",
@@ -68,11 +75,11 @@ PEXELS_PER_PAGE = _env_int("PERTURB_PEXELS_PER_PAGE", 40)
 PEXELS_PAGE_SPAN = _env_int("PERTURB_PEXELS_PAGE_SPAN", 10)
 PEXELS_IMAGE_VARIANT = os.getenv("PERTURB_PEXELS_IMAGE_VARIANT", "medium")
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
-TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 60)
+TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 30)
 QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 120)
-K_MINERS = _env_int("PERTURB_K_MINERS", 8)
-HISTORY_SIZE = _env_int("PERTURB_HISTORY_SIZE", 100)
-MIN_PROCESSED_COUNT = _env_int("PERTURB_MIN_PROCESSED_COUNT", 100)
+K_MINERS = _env_int("PERTURB_K_MINERS", 50)
+HISTORY_SIZE = _env_int("PERTURB_HISTORY_SIZE", 50)
+MIN_PROCESSED_COUNT = _env_int("PERTURB_MIN_PROCESSED_COUNT", 50)
 LLM_ENDPOINT_URL = _env_first(
     ("PERTURB_LLM_ENDPOINT_URL", "PERTURB_LABEL_MATCH_ENDPOINT", "PERTURB_LLM_VERIFY_ENDPOINT"),
     "http://127.0.0.1:8081/verify-label",
@@ -82,10 +89,20 @@ LLM_ENDPOINT_MODEL = _env_first(
     "Qwen2.5-1.5B-Instruct",
 )
 LLM_ENDPOINT_TIMEOUT_SECONDS = _env_int("PERTURB_LLM_ENDPOINT_TIMEOUT_SECONDS", 20)
-MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.002)
-MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.12)
+MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.003)
+MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)
+MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
+MIN_PSNR_DB = _env_float("PERTURB_MIN_PSNR_DB", 38.0)
+LINF_COMPONENT_WEIGHT = _env_float("PERTURB_LINF_COMPONENT_WEIGHT", 0.7)
+RMSE_COMPONENT_WEIGHT = _env_float("PERTURB_RMSE_COMPONENT_WEIGHT", 0.3)
 MAX_CHALLENGE_ATTEMPTS = _env_int("PERTURB_MAX_CHALLENGE_ATTEMPTS", 12)
 MINER_EXPLORATION_RATIO = _env_float("PERTURB_MINER_EXPLORATION_RATIO", 0.20)
+WANDB_ENABLED = _env_bool("PERTURB_WANDB_ENABLED", False)
+WANDB_PROJECT = os.getenv("PERTURB_WANDB_PROJECT", "perturb-validator")
+WANDB_ENTITY = os.getenv("PERTURB_WANDB_ENTITY", "perturb-ai").strip()
+WANDB_RUN_NAME = os.getenv("PERTURB_WANDB_RUN_NAME", "").strip()
+WANDB_MODE = os.getenv("PERTURB_WANDB_MODE", "online").strip()
+WANDB_LOG_CONSOLE = _env_bool("PERTURB_WANDB_LOG_CONSOLE", True)
 
 VALIDATOR_CONFIG = {
     "image_endpoint": IMAGE_ENDPOINT,
@@ -104,8 +121,18 @@ VALIDATOR_CONFIG = {
     "llm_endpoint_timeout_seconds": LLM_ENDPOINT_TIMEOUT_SECONDS,
     "min_linf_delta": MIN_LINF_DELTA,
     "max_linf_delta": MAX_LINF_DELTA,
+    "min_ssim": MIN_SSIM,
+    "min_psnr_db": MIN_PSNR_DB,
+    "linf_component_weight": LINF_COMPONENT_WEIGHT,
+    "rmse_component_weight": RMSE_COMPONENT_WEIGHT,
     "max_challenge_attempts": MAX_CHALLENGE_ATTEMPTS,
     "miner_exploration_ratio": MINER_EXPLORATION_RATIO,
+    "wandb_enabled": WANDB_ENABLED,
+    "wandb_project": WANDB_PROJECT,
+    "wandb_entity": WANDB_ENTITY,
+    "wandb_run_name": WANDB_RUN_NAME,
+    "wandb_mode": WANDB_MODE,
+    "wandb_log_console": WANDB_LOG_CONSOLE,
 }
 
 # Validator scoring defaults.

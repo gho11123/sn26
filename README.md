@@ -14,7 +14,7 @@ This repository provides:
 ### Validator responsibilities
 
 - Pull challenge images from Pexels Search API (`PERTURB_IMAGE_ENDPOINT`)
-- Run fixed classifier (`EfficientNet-B5`) on pulled image
+- Run fixed classifier (`EfficientNetV2-M`) on pulled image
 - Verify semantic consistency of model output vs prompt label through local `llm_endpoint`
 - Build and broadcast `AttackChallenge` synapse to selected miners
 - Verify miner responses and compute rewards
@@ -32,7 +32,7 @@ This repository provides:
 1. Validator samples a prompt from `perturbnet/constants.py` (`PROMPTS`)
 2. Validator fetches image from Pexels using `query=<prompt>` and random page/photo selection
 3. If API pull fails, validator falls back to `assets/dog_1.jpg` and sets prompt to `dog`
-4. Validator runs `EfficientNet-B5` and gets exact model label string
+4. Validator runs `EfficientNetV2-M` and gets exact model label string
 5. Validator calls local `llm_endpoint` (`POST /verify-label`) to confirm semantic match between model label and prompt
 6. On success, validator creates challenge where `true_label` is the exact EfficientNet label
 7. Validator sends challenge to sampled miners and scores returned perturbations
@@ -169,6 +169,9 @@ Important validator-specific fields:
 - `PERTURB_MIN_PROCESSED_COUNT`
 - `PERTURB_MIN_LINF_DELTA`
 - `PERTURB_MAX_LINF_DELTA`
+- `PERTURB_WANDB_ENABLED` (`true` to enable validator metrics logging to Weights & Biases)
+- `PERTURB_WANDB_PROJECT`, `PERTURB_WANDB_ENTITY`, `PERTURB_WANDB_RUN_NAME`, `PERTURB_WANDB_MODE`
+- `PERTURB_WANDB_LOG_CONSOLE` (`true` to forward validator console logs to W&B as well)
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
 
 ### 3) Start validator stack (llm_endpoint + validator)
@@ -273,7 +276,7 @@ Operations endpoints:
 Key fields sent to miners:
 
 - `task_id`
-- `model_name` (fixed `EfficientNet-B5`)
+- `model_name` (fixed `EfficientNetV2-M`)
 - `prompt` (broad label)
 - `clean_image_b64`
 - `true_label` (exact EfficientNet class label)
@@ -287,16 +290,25 @@ Miner response field:
 
 Per-response score (if verification passes):
 
-- `perturbation_score = 1 - min(norm / epsilon, 1)`
+- Hard gates:
+  - `min_linf_delta <= norm <= min(epsilon, max_linf_delta)`
+  - `ssim(clean, adv) >= min_ssim`
+  - `psnr_db(clean, adv) >= min_psnr_db`
+  - predicted label must differ from the original label
+- `linf_ratio = clamp((norm - min_linf_delta) / (min(epsilon, max_linf_delta) - min_linf_delta), 0, 1)`
+- `rmse_ratio = clamp(rmse / min(epsilon, max_linf_delta), 0, 1)`
+- `linf_score = (1 - linf_ratio)^2`
+- `rmse_score = (1 - rmse_ratio)^2`
+- `perturbation_score = weighted_avg(linf_score, rmse_score)` using `PERTURB_LINF_COMPONENT_WEIGHT` and `PERTURB_RMSE_COMPONENT_WEIGHT`
 - `speed_score = 1 - min(response_time / timeout, 1)`
-- `final = 0.65 * perturbation_score + 0.35 * speed_score`
+- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score`
 
 Any verification or constraint failure gets `0.0`.
 
 Weight setting:
 
 - Only miners with `processed_count > 100` are weight-eligible
-- Rank bonuses: `50, 30, 10, 5 (ranks 4-10), 3 (remaining)`
+- Emission schedule: top-5 only with fixed shares `62%, 24%, 9%, 4%, 1%` (ranks 6+ receive 0)
 - Final weights combine normalized rolling average and normalized rank bonus, then normalize to sum 1
 
 ## Integration Smoke Test
@@ -311,7 +323,7 @@ The smoke test validates:
 
 - llm_endpoint health and semantic sanity checks
 - image fetch from configured image endpoint
-- local EfficientNet-B5 inference path
+- local EfficientNetV2-M inference path
 - challenge semantic verification through llm endpoint
 
 ## Troubleshooting
