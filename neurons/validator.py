@@ -118,7 +118,8 @@ def _make_axon(wallet, config):
 
 def _configure_log_level(level_raw: str) -> None:
     level_name = (level_raw or "DEBUG").upper()
-    level = getattr(pylogging, level_name, pylogging.INFO)
+    requested_level = getattr(pylogging, level_name, pylogging.INFO)
+    level = max(int(pylogging.INFO), int(requested_level))
     pylogging.basicConfig(
         level=level,
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
