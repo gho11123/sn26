@@ -207,11 +207,18 @@ class PerturbMiner:
     async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
         task_id = getattr(synapse, "task_id", "unknown")
         forward_start = time.time()
+        dendrite = getattr(synapse, "dendrite", None)
+        caller_ip = getattr(dendrite, "ip", None)
+        caller_port = getattr(dendrite, "port", None)
+        caller_hotkey = getattr(dendrite, "hotkey", None)
         self._log_step_start(
             "miner_forward",
             task_id=task_id,
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
+            caller_ip=caller_ip,
+            caller_port=caller_port,
+            caller_hotkey=caller_hotkey,
         )
         if synapse.norm_type != "Linf":
             logger.info(f"Skipping task={task_id}: unsupported norm_type={synapse.norm_type}")
@@ -286,26 +293,37 @@ class PerturbMiner:
         return synapse
 
     async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
+        dendrite = getattr(synapse, "dendrite", None)
+        caller_ip = getattr(dendrite, "ip", None)
+        caller_port = getattr(dendrite, "port", None)
+        caller_hotkey = getattr(dendrite, "hotkey", None)
         self._log_step_start(
             "miner_blacklist",
             task_id=getattr(synapse, "task_id", "unknown"),
-            caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+            caller_ip=caller_ip,
+            caller_port=caller_port,
+            caller_hotkey=caller_hotkey,
         )
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            logger.warning("Blacklist reject: missing caller hotkey")
+        if dendrite is None or caller_hotkey is None:
+            logger.warning(f"Blacklist reject: missing caller hotkey ip={caller_ip}")
             return True, "Missing caller hotkey"
 
-        hotkey = synapse.dendrite.hotkey
-        if hotkey not in self.metagraph.hotkeys:
-            logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
+        if caller_hotkey not in self.metagraph.hotkeys:
+            logger.warning(
+                f"Blacklist reject: unregistered caller hotkey={caller_hotkey} ip={caller_ip}:{caller_port}"
+            )
             return True, "Unregistered caller"
 
-        uid = self.metagraph.hotkeys.index(hotkey)
+        uid = self.metagraph.hotkeys.index(caller_hotkey)
         if not self.metagraph.validator_permit[uid]:
-            logger.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
+            logger.warning(
+                f"Blacklist reject: caller uid={uid} hotkey={caller_hotkey} ip={caller_ip}:{caller_port} lacks validator permit"
+            )
             return True, "Caller is not validator"
 
-        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey}")
+        logger.info(
+            f"Blacklist allow: caller uid={uid} hotkey={caller_hotkey} ip={caller_ip}:{caller_port}"
+        )
         return False, "OK"
 
     async def priority(self, synapse: AttackChallenge) -> float:
