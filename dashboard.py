@@ -32,7 +32,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 
 MINER_RE = re.compile(
@@ -648,6 +648,21 @@ INDEX_HTML = r"""<!doctype html>
     table.clickable tbody tr.detail-row:hover > td { background: var(--bg); }
     .detail-meta { color: var(--muted); margin-bottom: 8px; font-size: 12px; }
     .detail-meta b { color: var(--text); font-weight: 500; }
+    .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .pager button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 3px 9px; font: inherit; cursor: pointer; min-width: 28px; }
+    .pager button:hover:not(:disabled) { background: var(--border); }
+    .pager button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .pager .pg-info b { color: var(--text); font-weight: 500; }
+    .pager .pg-size { margin-left: auto; }
+    .pager .pg-size select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 2px 4px; font: inherit; }
+    .filter-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; font-size: 12px; }
+    .filter-bar input[type="text"] { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font: inherit; width: 240px; }
+    .filter-bar input[type="text"]:focus { outline: none; border-color: var(--accent); }
+    .filter-bar button { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); border-radius: 3px; padding: 4px 9px; font: inherit; cursor: pointer; }
+    .filter-bar button:hover { background: var(--border); color: var(--text); }
+    .filter-bar .filter-label { color: var(--muted); }
+    .filter-bar .filter-stats { color: var(--muted); margin-left: 8px; }
+    tr.filtered-out { display: none !important; }
     .bar { height: 14px; background: var(--panel-2); border-radius: 3px; position: relative; overflow: hidden; }
     .bar > div { height: 100%; background: var(--accent); }
     .bar.good > div { background: var(--good); }
@@ -742,6 +757,12 @@ function renderChallenges(challenges) {
   let html = `<div class="muted" style="margin-bottom:8px">
     Click a row to expand per-miner results. ${challengeData.length} challenge(s) in the log window.
   </div>`;
+  html += `<div class="filter-bar">
+    <span class="filter-label">filter by block:</span>
+    <input id="challenge-filter-block" type="text" placeholder="e.g. 8181890 (substring match)" autocomplete="off">
+    <button id="challenge-filter-clear" title="Clear filter">clear</button>
+    <span class="filter-stats" id="challenge-filter-stats"></span>
+  </div>`;
   html += `<table class="sortable clickable" id="challenges-table"><thead><tr>
     <th>block</th><th>task id</th><th>ts</th><th>prompt</th><th>ε</th>
     <th>responses</th><th>succ</th><th>succ%</th>
@@ -810,6 +831,9 @@ function renderChallengeDetailRow(taskId) {
   return `<tr class="detail-row" data-task="${taskId}"><td colspan="${CHALLENGE_COLSPAN}">${inner}</td></tr>`;
 }
 
+const VAL_COLSPAN = 4; // matches the number of <th> in the validator-side ranking table
+let selectedUid = null;  // uid of the row currently expanded in val-table
+
 function renderValidatorLeaderboard(rows, latestEvent, topN) {
   if (!rows || rows.length === 0) {
     return `<div class='muted'>No weights_summary captured yet. The validator only emits the
@@ -817,22 +841,25 @@ function renderValidatorLeaderboard(rows, latestEvent, topN) {
       tempo (~72 minutes). Once a set_weights event has flowed through the log, this card
       will populate.</div>`;
   }
-  // Only show miners with avg100 > 0 (the rest are unranked / no rolling history).
-  const ranked = rows.filter(r => r.avg100 > 0).slice(0, topN);
+  // Show all miners with avg100 > 0 (the rest are unranked / no rolling history).
+  // Pagination handles cutting it into pages of 20.
+  const ranked = rows.filter(r => r.avg100 > 0);
   const banner = latestEvent
     ? `<div class="muted" style="margin-bottom:8px">
          Last set_weights @ ${latestEvent.ts || "—"} &middot;
          eligible=${latestEvent.eligible} &middot;
          distributed=${latestEvent.distributed} &middot;
-         ranked uids=${latestEvent.ranks_count}
+         ranked uids=${latestEvent.ranks_count} &middot;
+         click a row to expand per-challenge scores for that uid
        </div>`
     : "";
-  let html = banner + `<table class="sortable" id="val-table"><thead><tr>
+  let html = banner + `<table class="sortable clickable" id="val-table"><thead><tr>
     <th>rank</th><th>uid</th><th>avg100</th><th>emission</th>
   </tr></thead><tbody>`;
   for (const r of ranked) {
     const pillCls = r.emission > 0 ? "good" : (r.rank <= 5 ? "warn" : "");
-    html += `<tr>
+    const selectedCls = (String(r.uid) === String(selectedUid)) ? " selected" : "";
+    html += `<tr class="${selectedCls.trim()}" data-uid="${r.uid}">
       <td data-sort="${r.rank}"><span class="pill ${pillCls}">#${r.rank}</span></td>
       <td data-sort="${r.uid}"><b>${r.uid}</b></td>
       <td class="num" data-sort="${r.avg100}">${r.avg100.toFixed(6)}</td>
@@ -844,6 +871,51 @@ function renderValidatorLeaderboard(rows, latestEvent, topN) {
     html += `<div class='muted' style="margin-top:8px">No miners with avg100 > 0 yet.</div>`;
   }
   return html;
+}
+
+// Returns an HTML <tr class="detail-row"> with this uid's score across every
+// challenge captured in the log window. Inserted into val-table tbody right
+// after the uid's data row.
+function renderUidDetailRow(uid) {
+  const matches = [];
+  for (const c of challengeData) {
+    const r = c.results.find(x => Number(x.uid) === Number(uid));
+    if (r) matches.push({...r, block: c.block, task_id: c.task_id, ts: c.ts, prompt: c.prompt, chal_eps: c.epsilon});
+  }
+  matches.sort((a, b) => (b.block || 0) - (a.block || 0));
+  const succ = matches.filter(r => r.reason === "success").length;
+  let inner = `<div class="detail-meta"><b>uid ${uid}</b>
+    &middot; appeared in <b>${matches.length}</b> challenge(s) in this log window
+    &middot; <b>${succ}</b> success(es)
+  </div>`;
+  if (matches.length === 0) {
+    inner += `<div class='muted'>This uid did not appear in any captured challenge.</div>`;
+    return `<tr class="detail-row" data-uid="${uid}"><td colspan="${VAL_COLSPAN}">${inner}</td></tr>`;
+  }
+  inner += `<table class="sortable" id="uid-detail-table"><thead><tr>
+    <th>block</th><th>task id</th><th>ts</th><th>prompt</th><th>ε</th>
+    <th>status</th><th>score</th><th>reason</th>
+    <th>L∞</th><th>RMSE</th><th>SSIM</th><th>PSNR</th><th>RT (ms)</th>
+  </tr></thead><tbody>`;
+  for (const r of matches) {
+    inner += `<tr>
+      <td data-sort="${r.block ?? 0}"><b>${r.block ?? "—"}</b></td>
+      <td data-sort="${r.task_id || ''}" title="${r.task_id || ''}" style="font-size:11px; max-width: 220px; overflow:hidden; text-overflow: ellipsis;">${r.task_id || "—"}</td>
+      <td data-sort="${r.ts || ''}">${r.ts || "—"}</td>
+      <td data-sort="${r.prompt || ''}">${r.prompt || "—"}</td>
+      <td class="num" data-sort="${r.chal_eps ?? ''}">${fmtNum(r.chal_eps, 4)}</td>
+      <td data-sort="${r.status}"><span class="pill ${statusClass(r.status)}">${r.status}</span></td>
+      <td class="num" data-sort="${r.score}">${r.score.toFixed(6)}</td>
+      <td data-sort="${r.reason}"><span class="pill ${reasonClass(r.reason)}">${r.reason}</span></td>
+      <td class="num" data-sort="${r.norm}">${fmtNum(r.norm, 5)}</td>
+      <td class="num" data-sort="${r.rmse}">${fmtNum(r.rmse, 5)}</td>
+      <td class="num" data-sort="${r.ssim}">${fmtNum(r.ssim, 4)}</td>
+      <td class="num" data-sort="${r.psnr_db}">${fmtNum(r.psnr_db, 2)}</td>
+      <td class="num" data-sort="${r.response_time_ms ?? ''}">${r.response_time_ms ?? "—"}</td>
+    </tr>`;
+  }
+  inner += "</tbody></table>";
+  return `<tr class="detail-row" data-uid="${uid}"><td colspan="${VAL_COLSPAN}">${inner}</td></tr>`;
 }
 
 function render(s) {
@@ -870,9 +942,38 @@ function render(s) {
   `;
 }
 
-// Sortable tables — sort state is global and survives re-renders so 30s
-// auto-refresh doesn't reset the user's chosen column/direction.
-const sortState = {}; // { tableId: { col: number, dir: 'asc'|'desc' } }
+// ── Sorting & pagination ────────────────────────────────────────────────────
+// Both sort state and page state are GLOBAL by table id, so they survive the
+// 30 s auto-refresh of the page.
+const sortState   = {}; // { tableId: { col: number, dir: 'asc'|'desc' } }
+const pageState   = {}; // { tableId: { page: number, size: number, totalPages: number } }
+const filterState = {}; // { tableId: { <field>: <substring> } } — supports per-column filters
+const DEFAULT_PAGE_SIZE = 20;
+
+// Mark rows that don't match the active filter with class="filtered-out".
+// Currently only the challenges-table supports a `block` substring filter
+// (first column). Add more cases here if more tables get filters later.
+function applyFilter(table) {
+  const tid = table.id;
+  const fs = filterState[tid];
+  const tbody = table.querySelector("tbody");
+  if (!tbody) return;
+  const dataRows = Array.from(tbody.querySelectorAll(":scope > tr:not(.detail-row)"));
+  if (!fs) {
+    dataRows.forEach(r => r.classList.remove("filtered-out"));
+    return;
+  }
+  if (tid === "challenges-table") {
+    const q = (fs.block || "").trim();
+    for (const r of dataRows) {
+      const blockText = (r.cells[0]?.textContent || "").trim();
+      const match = !q || blockText.includes(q);
+      r.classList.toggle("filtered-out", !match);
+    }
+  } else {
+    dataRows.forEach(r => r.classList.remove("filtered-out"));
+  }
+}
 
 function applySort(table) {
   const tid = table.id;
@@ -881,12 +982,14 @@ function applySort(table) {
   const idx = st.col;
   const tbody = table.querySelector("tbody");
   if (!tbody) return;
-  // Only sort data rows; detail rows piggy-back on their parent data row.
+  // Only sort data rows. Each data row's optional detail row (its NEXT sibling
+  // before sort) is moved together with it so they stay adjacent after sort.
   const dataRows = Array.from(tbody.querySelectorAll(":scope > tr:not(.detail-row)"));
-  const detailByTask = {};
-  Array.from(tbody.querySelectorAll(":scope > tr.detail-row")).forEach(d => {
-    if (d.dataset.task) detailByTask[d.dataset.task] = d;
-  });
+  const detailByRow = new Map();
+  for (const dr of dataRows) {
+    const next = dr.nextElementSibling;
+    if (next && next.classList.contains("detail-row")) detailByRow.set(dr, next);
+  }
   dataRows.sort((a, b) => {
     const av = a.cells[idx]?.dataset.sort ?? a.cells[idx]?.textContent ?? "";
     const bv = b.cells[idx]?.dataset.sort ?? b.cells[idx]?.textContent ?? "";
@@ -902,16 +1005,134 @@ function applySort(table) {
     }
     return st.dir === "asc" ? cmp : -cmp;
   });
-  // Re-append in sorted order; a detail row follows its data row.
   for (const r of dataRows) {
     tbody.appendChild(r);
-    const t = r.dataset.task;
-    if (t && detailByTask[t]) tbody.appendChild(detailByTask[t]);
+    const det = detailByRow.get(r);
+    if (det) tbody.appendChild(det);
   }
   Array.from(table.querySelectorAll("thead th")).forEach((th, i) => {
     th.classList.remove("sort-asc", "sort-desc");
     if (i === idx) th.classList.add(st.dir === "asc" ? "sort-asc" : "sort-desc");
   });
+}
+
+function ensurePager(table) {
+  const tid = table.id;
+  if (!tid) return null;
+  const pid = `pager-${tid}`;
+  let p = document.getElementById(pid);
+  if (p) return p;
+  p = document.createElement("div");
+  p.id = pid;
+  p.className = "pager";
+  p.dataset.table = tid;
+  p.innerHTML =
+    `<button class="pg-first" title="First page">«</button>` +
+    `<button class="pg-prev"  title="Previous page">‹</button>` +
+    `<span class="pg-info">page <b class="pg-cur">1</b> / <b class="pg-total">1</b></span>` +
+    `<button class="pg-next"  title="Next page">›</button>` +
+    `<button class="pg-last"  title="Last page">»</button>` +
+    `<span class="pg-rows"></span>` +
+    `<span class="pg-size">rows/page ` +
+      `<select>` +
+        `<option value="10">10</option>` +
+        `<option value="20" selected>20</option>` +
+        `<option value="50">50</option>` +
+        `<option value="100">100</option>` +
+      `</select>` +
+    `</span>`;
+  table.parentNode.insertBefore(p, table.nextSibling);
+  p.querySelector(".pg-first").addEventListener("click", () => goToPage(tid, 1));
+  p.querySelector(".pg-prev" ).addEventListener("click", () => goToPage(tid, getPage(tid) - 1));
+  p.querySelector(".pg-next" ).addEventListener("click", () => goToPage(tid, getPage(tid) + 1));
+  p.querySelector(".pg-last" ).addEventListener("click", () => goToPage(tid, getTotalPages(tid)));
+  p.querySelector(".pg-size select").addEventListener("change", (e) => {
+    const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+    ps.size = parseInt(e.target.value, 10) || DEFAULT_PAGE_SIZE;
+    ps.page = 1;
+    pageState[tid] = ps;
+    const t = document.getElementById(tid);
+    if (t) applyPagination(t);
+  });
+  return p;
+}
+
+function getPage(tid)       { return (pageState[tid] || {}).page || 1; }
+function getTotalPages(tid) { return (pageState[tid] || {}).totalPages || 1; }
+
+function goToPage(tid, page) {
+  const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+  pageState[tid] = ps;
+  ps.page = Math.max(1, Math.min(page, ps.totalPages || 1));
+  const t = document.getElementById(tid);
+  if (t) applyPagination(t);
+}
+
+function applyPagination(table) {
+  const tid = table.id;
+  const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+  pageState[tid] = ps;
+  const tbody = table.querySelector("tbody");
+  if (!tbody) return;
+  // Pagination operates only on rows that passed the filter.
+  const dataRows = Array.from(tbody.querySelectorAll(":scope > tr:not(.detail-row)"));
+  const matched = dataRows.filter(r => !r.classList.contains("filtered-out"));
+  const total = matched.length;
+  const allTotal = dataRows.length;
+  const totalPages = Math.max(1, Math.ceil(total / ps.size));
+  ps.totalPages = totalPages;
+  if (ps.page > totalPages) ps.page = totalPages;
+  if (ps.page < 1) ps.page = 1;
+  const start = (ps.page - 1) * ps.size;
+  const end = start + ps.size;
+  // Hide all data rows + their detail rows first (filtered rows stay hidden via the class).
+  for (const r of dataRows) {
+    r.style.display = r.classList.contains("filtered-out") ? "" : "none";
+    const next = r.nextElementSibling;
+    if (next && next.classList.contains("detail-row")) {
+      next.style.display = r.classList.contains("filtered-out") ? "" : "none";
+    }
+  }
+  // Reveal only the rows on the current page (counted across matched rows).
+  matched.forEach((r, idx) => {
+    if (idx >= start && idx < end) {
+      r.style.display = "";
+      const next = r.nextElementSibling;
+      if (next && next.classList.contains("detail-row")) next.style.display = "";
+    }
+  });
+  const pager = ensurePager(table);
+  if (pager) {
+    pager.querySelector(".pg-cur").textContent = ps.page;
+    pager.querySelector(".pg-total").textContent = totalPages;
+    const filterActive = total !== allTotal;
+    pager.querySelector(".pg-rows").innerHTML = total
+      ? `<span class="muted">— rows ${start+1}–${Math.min(end, total)} of ${total}${filterActive ? ` <i>(filtered from ${allTotal})</i>` : ""}</span>`
+      : `<span class="muted">— no rows match${filterActive ? ` (filtered from ${allTotal})` : ""}</span>`;
+    pager.querySelector(".pg-first").disabled = ps.page <= 1;
+    pager.querySelector(".pg-prev" ).disabled = ps.page <= 1;
+    pager.querySelector(".pg-next" ).disabled = ps.page >= totalPages;
+    pager.querySelector(".pg-last" ).disabled = ps.page >= totalPages;
+    const sel = pager.querySelector(".pg-size select");
+    if (sel && sel.value != String(ps.size)) sel.value = String(ps.size);
+  }
+  // Update the challenges-table filter stats line, if present.
+  if (tid === "challenges-table") {
+    const stats = document.getElementById("challenge-filter-stats");
+    if (stats) {
+      const fs = filterState[tid];
+      const q = fs && fs.block ? fs.block.trim() : "";
+      stats.textContent = q
+        ? `${total} of ${allTotal} match "${q}"`
+        : "";
+    }
+  }
+}
+
+function refreshTable(table) {
+  applyFilter(table);
+  applySort(table);
+  applyPagination(table);
 }
 
 function wireSortable(table) {
@@ -924,29 +1145,26 @@ function wireSortable(table) {
       if (cur && cur.col === idx) {
         dir = cur.dir === "asc" ? "desc" : "asc";
       } else {
-        // First click on a column: numeric columns sort descending first,
-        // text columns ascending first.
         const sample = table.querySelector(`tbody tr td:nth-child(${idx+1})`);
         const v = sample ? (sample.dataset.sort ?? sample.textContent) : "";
         dir = (!isNaN(parseFloat(v)) && /^-?[\d.eE+-]+$/.test(String(v))) ? "desc" : "asc";
       }
       sortState[tid] = { col: idx, dir };
-      applySort(table);
+      refreshTable(table);
     });
   });
-  if (sortState[tid]) applySort(table);
+  refreshTable(table);
 }
 
+// ── Expand / collapse: challenges-table → per-miner scores ─────────────────
 function expandChallengeRow(dataRow) {
   const taskId = dataRow.dataset.task;
   if (!taskId) return;
   const tbody = dataRow.parentNode;
-  // Remove any other expanded detail row (single-select).
   Array.from(tbody.querySelectorAll(":scope > tr.detail-row")).forEach(d => d.remove());
   Array.from(tbody.querySelectorAll(":scope > tr.selected")).forEach(x => x.classList.remove("selected"));
   dataRow.classList.add("selected");
   dataRow.insertAdjacentHTML("afterend", renderChallengeDetailRow(taskId));
-  // Wire sort on the freshly inserted inner table.
   const det = document.getElementById("detail-table");
   if (det) wireSortable(det);
 }
@@ -973,23 +1191,107 @@ function wireChallengeClicks() {
         expandChallengeRow(tr);
         selectedTaskId = taskId;
       }
+      applyPagination(t);  // detail row added/removed may shift visible counts
     });
   });
+}
+
+// ── Expand / collapse: val-table → per-challenge scores for a single uid ───
+function expandUidRow(dataRow) {
+  const uid = dataRow.dataset.uid;
+  if (!uid) return;
+  const tbody = dataRow.parentNode;
+  Array.from(tbody.querySelectorAll(":scope > tr.detail-row")).forEach(d => d.remove());
+  Array.from(tbody.querySelectorAll(":scope > tr.selected")).forEach(x => x.classList.remove("selected"));
+  dataRow.classList.add("selected");
+  dataRow.insertAdjacentHTML("afterend", renderUidDetailRow(parseInt(uid, 10)));
+  const det = document.getElementById("uid-detail-table");
+  if (det) wireSortable(det);
+}
+
+function collapseUidRow(dataRow) {
+  const tbody = dataRow.parentNode;
+  Array.from(tbody.querySelectorAll(":scope > tr.detail-row")).forEach(d => d.remove());
+  dataRow.classList.remove("selected");
+}
+
+function wireValClicks() {
+  const t = document.getElementById("val-table");
+  if (!t) return;
+  Array.from(t.querySelectorAll("tbody tr:not(.detail-row)")).forEach(tr => {
+    tr.addEventListener("click", () => {
+      const uid = tr.dataset.uid;
+      if (!uid) return;
+      const next = tr.nextElementSibling;
+      const isExpanded = next && next.classList.contains("detail-row") && next.dataset.uid === uid;
+      if (isExpanded) {
+        collapseUidRow(tr);
+        selectedUid = null;
+      } else {
+        expandUidRow(tr);
+        selectedUid = uid;
+      }
+      applyPagination(t);
+    });
+  });
+}
+
+function wireChallengeFilter() {
+  const input = document.getElementById("challenge-filter-block");
+  const clear = document.getElementById("challenge-filter-clear");
+  const tid = "challenges-table";
+  const t   = document.getElementById(tid);
+  if (!input || !t) return;
+  // Restore saved value.
+  const savedQ = (filterState[tid] && filterState[tid].block) || "";
+  if (input.value !== savedQ) input.value = savedQ;
+  input.addEventListener("input", () => {
+    const fs = filterState[tid] || {};
+    fs.block = input.value;
+    filterState[tid] = fs;
+    const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+    ps.page = 1;   // typing always resets to page 1
+    pageState[tid] = ps;
+    refreshTable(t);
+  });
+  if (clear) {
+    clear.addEventListener("click", () => {
+      input.value = "";
+      const fs = filterState[tid] || {};
+      fs.block = "";
+      filterState[tid] = fs;
+      const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+      ps.page = 1;
+      pageState[tid] = ps;
+      refreshTable(t);
+      input.focus();
+    });
+  }
 }
 
 function rewireAll() {
   document.querySelectorAll("table.sortable").forEach(wireSortable);
   wireChallengeClicks();
-  // If a challenge was expanded before the refresh, re-insert its detail row.
+  wireValClicks();
+  wireChallengeFilter();
+  // Restore previously expanded challenge.
   if (selectedTaskId) {
     const t = document.getElementById("challenges-table");
     if (t) {
       const row = t.querySelector(`tbody tr[data-task="${selectedTaskId}"]:not(.detail-row)`);
-      if (row) {
-        expandChallengeRow(row);
-      } else {
-        selectedTaskId = null;
-      }
+      if (row) expandChallengeRow(row);
+      else selectedTaskId = null;
+      applyPagination(t);
+    }
+  }
+  // Restore previously expanded uid.
+  if (selectedUid) {
+    const t = document.getElementById("val-table");
+    if (t) {
+      const row = t.querySelector(`tbody tr[data-uid="${selectedUid}"]:not(.detail-row)`);
+      if (row) expandUidRow(row);
+      else selectedUid = null;
+      applyPagination(t);
     }
   }
 }
@@ -1067,6 +1369,83 @@ def make_handler(cache: StatsCache, top_n: int, recent_loops: int):
                 )
                 stats["_serve_ms"] = round((time.monotonic() - t0) * 1000, 1)
                 body = json.dumps(stats, default=str).encode("utf-8")
+                self._send(200, body, "application/json")
+                return
+
+            if path == "/api/challenge":
+                # Fetch a single challenge's full per-miner results for analysis.
+                # Query params (one of):
+                #   ?block=<int>          exact match on the challenge's block number
+                #   ?task_id=<str>        exact match on full task_id
+                # Optional:
+                #   ?format=csv           return a CSV of the per-miner results
+                #                         (response includes header row + one row per uid)
+                qs = parse_qs(parsed.query or "")
+                block_q = (qs.get("block") or [""])[0].strip()
+                task_q  = (qs.get("task_id") or [""])[0].strip()
+                fmt     = (qs.get("format") or ["json"])[0].strip().lower()
+
+                if not block_q and not task_q:
+                    err = {"ok": False, "error": "specify ?block=<n> or ?task_id=<id>"}
+                    self._send(400, json.dumps(err).encode("utf-8"), "application/json")
+                    return
+
+                stats = cache.get(force=False)
+                challenges = stats.get("challenges_detailed", [])
+
+                if task_q:
+                    matches = [c for c in challenges if c.get("task_id") == task_q]
+                else:
+                    try:
+                        target = int(block_q)
+                    except ValueError:
+                        err = {"ok": False, "error": f"block must be an integer, got {block_q!r}"}
+                        self._send(400, json.dumps(err).encode("utf-8"), "application/json")
+                        return
+                    matches = [c for c in challenges if c.get("block") == target]
+
+                if not matches:
+                    err = {
+                        "ok": False,
+                        "error": "no challenge matched",
+                        "query": {"block": block_q, "task_id": task_q},
+                        "hint": "the log window may not contain this challenge; try /api/stats to see what's available",
+                    }
+                    self._send(404, json.dumps(err).encode("utf-8"), "application/json")
+                    return
+
+                # Newest first (challenges_detailed is already sorted by -block).
+                challenge = matches[0]
+
+                if fmt == "csv":
+                    fields = [
+                        "uid", "status", "score", "reason", "norm", "rmse",
+                        "ssim", "psnr_db", "epsilon", "response_time_ms",
+                        "processed", "ts",
+                    ]
+                    lines = [",".join(fields)]
+                    for r in challenge.get("results", []):
+                        row = []
+                        for f in fields:
+                            v = r.get(f)
+                            if v is None:
+                                row.append("")
+                            elif isinstance(v, str):
+                                row.append('"' + v.replace('"', '""') + '"')
+                            else:
+                                row.append(str(v))
+                        lines.append(",".join(row))
+                    body = ("\n".join(lines) + "\n").encode("utf-8")
+                    self._send(200, body, "text/csv; charset=utf-8")
+                    return
+
+                payload = {
+                    "ok": True,
+                    "query": {"block": block_q, "task_id": task_q},
+                    "matched_count": len(matches),
+                    "challenge": challenge,
+                }
+                body = json.dumps(payload, default=str).encode("utf-8")
                 self._send(200, body, "application/json")
                 return
 
