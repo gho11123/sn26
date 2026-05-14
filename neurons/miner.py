@@ -203,6 +203,7 @@ class PerturbMiner:
 
     async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
         task_id = getattr(synapse, "task_id", "unknown")
+        forward_start = time.time()
         self._log_step_start(
             "miner_forward",
             task_id=task_id,
@@ -215,7 +216,11 @@ class PerturbMiner:
             self._save_task(
                 synapse,
                 perturbed_b64=None,
-                extra={"status": "skipped_unsupported_norm", "norm_type": synapse.norm_type},
+                extra={
+                    "status": "skipped_unsupported_norm",
+                    "norm_type": synapse.norm_type,
+                    "response_time_ms": int((time.time() - forward_start) * 1000),
+                },
             )
             return synapse
 
@@ -229,7 +234,10 @@ class PerturbMiner:
             self._save_task(
                 synapse,
                 perturbed_b64=None,
-                extra={"status": "skipped_unresolved_label"},
+                extra={
+                    "status": "skipped_unresolved_label",
+                    "response_time_ms": int((time.time() - forward_start) * 1000),
+                },
             )
             return synapse
 
@@ -263,9 +271,11 @@ class PerturbMiner:
 
         adv = best
         synapse.perturbed_image_b64 = encode_image_b64(adv)
+        response_time_ms = int((time.time() - forward_start) * 1000)
         logger.info(
             f"Finished task={task_id} target_idx={target_index} "
-            f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+            f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f} "
+            f"response_time_ms={response_time_ms}"
         )
         self._save_task(
             synapse,
@@ -275,6 +285,7 @@ class PerturbMiner:
                 "target_index": int(target_index),
                 "final_pred": int(final_pred),
                 "best_delta": float(best_delta),
+                "response_time_ms": response_time_ms,
             },
         )
         return synapse
