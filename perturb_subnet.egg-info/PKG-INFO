@@ -10,5 +10,6 @@ Requires-Dist: pillow>=10.0.0
 Requires-Dist: requests>=2.31.0
 Requires-Dist: fastapi>=0.111.0
 Requires-Dist: uvicorn>=0.30.0
+Requires-Dist: wandb
 Dynamic: requires-dist
 Dynamic: summary

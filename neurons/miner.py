@@ -1,4 +1,6 @@
 import argparse
+import base64
+import json
 import logging as pylogging
 import os
 import time
@@ -97,12 +99,67 @@ class PerturbMiner:
 
         self.model = load_efficientnet_v2_m(self.device)
 
+        self.save_dir = os.path.abspath(
+            getattr(self.config, "save_dir", os.getenv("PERTURB_MINER_SAVE_DIR", "./tasks"))
+        )
+        os.makedirs(self.save_dir, exist_ok=True)
+        logger.info(f"[MINER] Saving challenge tasks under {self.save_dir}")
+
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self.axon.attach(
             forward_fn=self.forward,
             blacklist_fn=self.blacklist,
             priority_fn=self.priority,
         )
+
+    def _current_block(self) -> typing.Optional[int]:
+        try:
+            return int(self.subtensor.get_current_block())
+        except Exception as err:
+            logger.warning(f"[MINER] Failed to read current block: {err}")
+            return None
+
+    def _save_task(
+        self,
+        synapse: AttackChallenge,
+        perturbed_b64: typing.Optional[str],
+        extra: typing.Optional[typing.Dict[str, typing.Any]] = None,
+    ) -> None:
+        block = self._current_block()
+        dir_name = str(block) if block is not None else "block_unknown"
+        task_dir = os.path.join(self.save_dir, dir_name)
+        raw_task_id = getattr(synapse, "task_id", None) or "unknown"
+        try:
+            os.makedirs(task_dir, exist_ok=True)
+
+            clean_b64 = getattr(synapse, "clean_image_b64", None)
+            if clean_b64:
+                with open(os.path.join(task_dir, "clean.png"), "wb") as f:
+                    f.write(base64.b64decode(clean_b64))
+
+            if perturbed_b64:
+                with open(os.path.join(task_dir, "perturbed.png"), "wb") as f:
+                    f.write(base64.b64decode(perturbed_b64))
+
+            meta = {
+                "block": block,
+                "task_id": raw_task_id,
+                "model_name": getattr(synapse, "model_name", None),
+                "prompt": getattr(synapse, "prompt", None),
+                "true_label": getattr(synapse, "true_label", None),
+                "epsilon": getattr(synapse, "epsilon", None),
+                "norm_type": getattr(synapse, "norm_type", None),
+                "min_delta": getattr(synapse, "min_delta", None),
+                "timeout_seconds": getattr(synapse, "timeout_seconds", None),
+                "caller_hotkey": getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+                "saved_at": time.time(),
+            }
+            if extra:
+                meta.update(extra)
+            with open(os.path.join(task_dir, "meta.json"), "w") as f:
+                json.dump(meta, f, indent=2, default=str)
+        except Exception as err:
+            logger.warning(f"[MINER] Failed to save block={dir_name} task={raw_task_id}: {err}")
 
     def _log_step_start(self, step_name: str, **context: typing.Any) -> None:
         if context:
@@ -145,24 +202,35 @@ class PerturbMiner:
         self.metagraph.sync(subtensor=self.subtensor)
 
     async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
+        task_id = getattr(synapse, "task_id", "unknown")
         self._log_step_start(
             "miner_forward",
-            task_id=getattr(synapse, "task_id", "unknown"),
+            task_id=task_id,
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
         )
         if synapse.norm_type != "Linf":
-            logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
+            logger.info(f"Skipping task={task_id}: unsupported norm_type={synapse.norm_type}")
             synapse.perturbed_image_b64 = synapse.clean_image_b64
+            self._save_task(
+                synapse,
+                perturbed_b64=None,
+                extra={"status": "skipped_unsupported_norm", "norm_type": synapse.norm_type},
+            )
             return synapse
 
         clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
         target_index = resolve_target_index(synapse.true_label)
         if target_index is None:
             logger.warning(
-                f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
+                f"Skipping task={task_id}: unresolved true_label={getattr(synapse, 'true_label', None)}"
             )
             synapse.perturbed_image_b64 = synapse.clean_image_b64
+            self._save_task(
+                synapse,
+                perturbed_b64=None,
+                extra={"status": "skipped_unresolved_label"},
+            )
             return synapse
 
         epsilon = float(synapse.epsilon)
@@ -196,8 +264,18 @@ class PerturbMiner:
         adv = best
         synapse.perturbed_image_b64 = encode_image_b64(adv)
         logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
+            f"Finished task={task_id} target_idx={target_index} "
             f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+        )
+        self._save_task(
+            synapse,
+            perturbed_b64=synapse.perturbed_image_b64,
+            extra={
+                "status": "completed",
+                "target_index": int(target_index),
+                "final_pred": int(final_pred),
+                "best_delta": float(best_delta),
+            },
         )
         return synapse
 
@@ -278,6 +356,13 @@ def build_config() -> typing.Any:
         dest="axon_port",
         type=int,
         default=int(os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000"))),
+    )
+    parser.add_argument(
+        "--save-dir",
+        dest="save_dir",
+        type=str,
+        default=os.getenv("PERTURB_MINER_SAVE_DIR", "./tasks"),
+        help="Directory where each challenge is saved as <save_dir>/<task_id>/{clean.png,perturbed.png,meta.json}",
     )
 
     if hasattr(bt, "config"):
