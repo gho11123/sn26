@@ -27,12 +27,16 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import time
+
 import perturbnet.constants as C
-from perturbnet.image_io import decode_image_b64
+from perturbnet.attack import ATTACKS
+from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import (
     load_efficientnet_v2_m,
     normalize_prediction_label,
     predict_label,
+    resolve_target_index,
 )
 
 
@@ -105,6 +109,14 @@ def main() -> int:
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device for the EfficientNet inference and SSIM compute.",
     )
+    parser.add_argument(
+        "--attack",
+        choices=("saved", *sorted(ATTACKS.keys())),
+        default="baseline",
+        help="Which attack output to score. 'saved' reads the saved perturbed.png; "
+             "any other name re-runs that attack on clean.png and uses its live runtime "
+             "as response_time. Default: baseline.",
+    )
     args = parser.parse_args()
 
     tasks_root = Path(args.tasks_dir).resolve()
@@ -112,7 +124,10 @@ def main() -> int:
     meta_path = task_dir / "meta.json"
     clean_path = task_dir / "clean.png"
     perturbed_path = task_dir / "perturbed.png"
-    for required in (meta_path, clean_path, perturbed_path):
+    required_files = (meta_path, clean_path)
+    if args.attack == "saved":
+        required_files = (meta_path, clean_path, perturbed_path)
+    for required in required_files:
         if not required.exists():
             raise SystemExit(f"Missing required file: {required}")
 
@@ -129,7 +144,6 @@ def main() -> int:
     model = load_efficientnet_v2_m(device)
 
     x_clean = decode_image_b64(_png_bytes_to_b64(clean_path)).to(device)
-    x_adv = decode_image_b64(_png_bytes_to_b64(perturbed_path)).to(device)
 
     print(_hr("Task"))
     print(f"  dir                : {task_dir}")
@@ -143,6 +157,32 @@ def main() -> int:
     print(f"  miner_status       : {meta.get('status')}")
     print(f"  miner_final_pred   : {meta.get('final_pred')}  (target_index={meta.get('target_index')})")
     print(f"  caller_hotkey      : {meta.get('caller_hotkey')}")
+
+    attack_stats: dict | None = None
+    if args.attack == "saved":
+        x_adv = decode_image_b64(_png_bytes_to_b64(perturbed_path)).to(device)
+    else:
+        target_idx = resolve_target_index(true_label)
+        if target_idx is None:
+            raise SystemExit(f"Cannot resolve true_label '{true_label}' to an EfficientNet index.")
+        attack_fn = ATTACKS[args.attack]
+        attack_kwargs: dict = {"verbose": True}
+        if args.attack == "baseline":
+            attack_kwargs["epsilon"] = float(meta.get("epsilon", 0.03))
+            attack_kwargs["min_delta"] = float(meta.get("min_delta", 0.003))
+        print(_hr(f"Live attack ({args.attack}) re-run on clean.png"))
+        t0 = time.time()
+        adv, attack_stats = attack_fn(model, x_clean, int(target_idx), **attack_kwargs)
+        attack_elapsed_ms = int((time.time() - t0) * 1000)
+        adv_b64 = encode_image_b64(adv)
+        x_adv = decode_image_b64(adv_b64).to(device)
+        if args.response_time_ms is None:
+            response_time_ms = attack_elapsed_ms
+        print(
+            f"  -> status={attack_stats.get('status')}  iters={attack_stats.get('iterations')}  "
+            f"pixels={attack_stats.get('perturbed_pixel_channels')}  "
+            f"max_quanta={attack_stats.get('max_quanta_used')}  elapsed={response_time_ms}ms"
+        )
 
     print(_hr("Validator scoring constants"))
     print(f"  min_linf_delta            : {C.MIN_LINF_DELTA}")
@@ -236,24 +276,28 @@ def main() -> int:
     print(f"  response_time_ms    : {response_time_ms}  (timeout {int(timeout_seconds)}s)")
     print(f"  speed_score         : 1 - min(t/timeout,1) = {speed_score:.6f}")
 
-    print(_hr("Final"))
     if failed:
         primary = failed[0]
         reason = fail_reason_map.get(primary, "gate_failed")
-        print(f"  reason              : {reason}  (failed_gate='{primary}')")
-        print(f"  FINAL_SCORE         : 0.0")
-        print(
-            "\n  Note: score is 0 because a hard gate failed; the perturbation/speed numbers"
-            "\n  above are shown for diagnostic purposes only."
+        final = 0.0
+        final_note = f"  reason       : {reason}  (failed_gate='{primary}')"
+    else:
+        final = float(C.PERTURBATION_WEIGHT) * perturbation_score + float(C.SPEED_WEIGHT) * speed_score
+        final_note = (
+            f"  formula      : {C.PERTURBATION_WEIGHT}*perturbation_score + "
+            f"{C.SPEED_WEIGHT}*speed_score"
         )
-        return 0
 
-    final = float(C.PERTURBATION_WEIGHT) * perturbation_score + float(C.SPEED_WEIGHT) * speed_score
-    print(
-        f"  formula             : {C.PERTURBATION_WEIGHT}*perturbation_score + "
-        f"{C.SPEED_WEIGHT}*speed_score"
-    )
-    print(f"  FINAL_SCORE         : {final:.6f}")
+    quanta = int(round(norm * 255))
+    print(_hr("Final"))
+    print(f"  L∞           : {norm:.5f}    (={quanta}/255)")
+    print(f"  RMSE         : {rmse:.5f}")
+    print(f"  SSIM         : {ssim:.4f}")
+    print(f"  PSNR         : {psnr_db:.2f} dB")
+    print(f"  pred         : {normalized_prediction}")
+    print(f"  RT           : {response_time_ms} ms")
+    print(final_note)
+    print(f"  FINAL_SCORE  : {final:.6f}")
     return 0
 
 

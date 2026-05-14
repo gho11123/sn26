@@ -8,10 +8,10 @@ import typing
 
 import bittensor as bt
 import torch
-import torch.nn.functional as F
 
+from perturbnet.attack import cascade_attack
 from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_m, logits_for_images, predict_index, resolve_target_index
+from perturbnet.model import load_efficientnet_v2_m, resolve_target_index
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
@@ -112,11 +112,14 @@ class PerturbMiner:
             priority_fn=self.priority,
         )
 
-    def _current_block(self) -> typing.Optional[int]:
+    @staticmethod
+    def _block_from_task_id(task_id: typing.Any) -> typing.Optional[int]:
+        if task_id is None:
+            return None
+        head = str(task_id).split("-", 1)[0]
         try:
-            return int(self.subtensor.get_current_block())
-        except Exception as err:
-            logger.warning(f"[MINER] Failed to read current block: {err}")
+            return int(head)
+        except (TypeError, ValueError):
             return None
 
     def _save_task(
@@ -125,10 +128,10 @@ class PerturbMiner:
         perturbed_b64: typing.Optional[str],
         extra: typing.Optional[typing.Dict[str, typing.Any]] = None,
     ) -> None:
-        block = self._current_block()
+        raw_task_id = getattr(synapse, "task_id", None) or "unknown"
+        block = self._block_from_task_id(raw_task_id)
         dir_name = str(block) if block is not None else "block_unknown"
         task_dir = os.path.join(self.save_dir, dir_name)
-        raw_task_id = getattr(synapse, "task_id", None) or "unknown"
         try:
             os.makedirs(task_dir, exist_ok=True)
 
@@ -241,40 +244,23 @@ class PerturbMiner:
             )
             return synapse
 
-        epsilon = float(synapse.epsilon)
-        min_delta = float(getattr(synapse, "min_delta", 0.002))
+        adv, attack_stats = cascade_attack(
+            model=self.model,
+            x_clean=clean,
+            true_label_idx=int(target_index),
+        )
 
-        # Basic default algorithm: small-step untargeted PGD.
-        steps = 10
-        step_size = max(epsilon / 4.0, 1.0 / 255.0)
-        adv = clean.clone().detach()
-        best = adv.clone()
-        best_delta = 0.0
-        final_pred = target_index
-        for _ in range(steps):
-            adv.requires_grad_(True)
-            logits = logits_for_images(model=self.model, image_bchw=adv.unsqueeze(0))
-            loss = F.cross_entropy(logits, torch.tensor([target_index], device=self.device))
-            grad = torch.autograd.grad(loss, adv)[0]
-            adv = adv.detach() + step_size * grad.sign()
-            adv = torch.max(torch.min(adv, clean + epsilon), clean - epsilon).clamp(0.0, 1.0)
-
-            pred = predict_index(model=self.model, image_chw=adv)
-            final_pred = pred
-            delta = float((adv - clean).abs().max().item())
-            if delta > best_delta:
-                best = adv.clone()
-                best_delta = delta
-            if pred != target_index and delta >= min_delta:
-                best = adv.clone()
-                break
-
-        adv = best
         synapse.perturbed_image_b64 = encode_image_b64(adv)
         response_time_ms = int((time.time() - forward_start) * 1000)
         logger.info(
             f"Finished task={task_id} target_idx={target_index} "
-            f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f} "
+            f"final_pred={attack_stats.get('final_pred')} "
+            f"runner_up={attack_stats.get('runner_up_idx')} "
+            f"status={attack_stats.get('status')} "
+            f"iters={attack_stats.get('iterations')} "
+            f"pixels={attack_stats.get('perturbed_pixel_channels')} "
+            f"linf={attack_stats.get('final_linf'):.6f} "
+            f"rmse={attack_stats.get('final_rmse'):.6f} "
             f"response_time_ms={response_time_ms}"
         )
         self._save_task(
@@ -283,9 +269,18 @@ class PerturbMiner:
             extra={
                 "status": "completed",
                 "target_index": int(target_index),
-                "final_pred": int(final_pred),
-                "best_delta": float(best_delta),
+                "final_pred": int(attack_stats.get("final_pred", target_index)),
+                "best_delta": float(attack_stats.get("final_linf", 0.0)),
                 "response_time_ms": response_time_ms,
+                "attack": "cascade",
+                "attack_phase": str(attack_stats.get("phase", "")),
+                "attack_status": str(attack_stats.get("status", "")),
+                "iterations": int(attack_stats.get("iterations", 0)),
+                "perturbed_pixel_channels": int(attack_stats.get("perturbed_pixel_channels", 0)),
+                "final_rmse": float(attack_stats.get("final_rmse", 0.0)),
+                "max_quanta_used": int(attack_stats.get("max_quanta_used", 0)),
+                "runner_up_idx": int(attack_stats.get("runner_up_idx", -1)),
+                "initial_gap": float(attack_stats.get("initial_gap", 0.0)),
             },
         )
         return synapse
