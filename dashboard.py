@@ -24,13 +24,14 @@ Stdlib only — no Flask, no FastAPI.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
 import statistics
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -67,6 +68,10 @@ WEIGHTS_RE = re.compile(
     r"top5=(?P<top5>\S+)"
 )
 SET_WEIGHTS_RE = re.compile(r"set_weights (?P<result>success|failed)(?::\s*(?P<msg>.+))?")
+
+# Mirrors the validator's HISTORY_SIZE (perturbnet/constants.py).
+# Used to align dashboard rolling-window aggregations with `avg100`.
+HISTORY_SIZE = 50
 # verify_and_score lines: emitted at the start of each per-uid scoring call.
 # They carry the task_id and response_time_ms that the very next uid line belongs to
 # — but only for uids whose HTTP status was 200 (status != 200 skips verify_and_score).
@@ -89,14 +94,20 @@ def parse_log(path: str) -> dict:
         }
 
     # Per-uid running stats across the whole file.
+    # `scores` mirrors the validator's `score_histories[uid]` — every score the
+    # validator emitted for this uid, in chronological order, including zeros
+    # for failed rounds. Used by the "live" leaderboard view to simulate
+    # set_weights() on the data we've captured.
     per_uid: dict[int, dict] = defaultdict(
         lambda: {
             "n": 0,
             "succ": 0,
             "score_sum": 0.0,
+            "scores": [],
             "norms": [],
             "rmses": [],
             "psnrs": [],
+            "rts": [],
             "processed": 0,
             "last_status": None,
             "last_reason": None,
@@ -291,9 +302,17 @@ def parse_log(path: str) -> dict:
                 rmse = float(m.group("rmse"))
                 psnr = float(m.group("psnr"))
 
+                # Consume the response_time_ms attached to this row by the
+                # preceding verify_and_score line. Only status==200 emits that
+                # line in the validator, so non-200 rows have no rt.
+                rt = pending_verify_rt if status == 200 else None
+                if status == 200:
+                    pending_verify_rt = None
+
                 d = per_uid[uid]
                 d["n"] += 1
                 d["score_sum"] += score
+                d["scores"].append(score)
                 d["processed"] = max(d["processed"], processed)
                 d["last_status"] = status
                 d["last_reason"] = reason
@@ -303,6 +322,8 @@ def parse_log(path: str) -> dict:
                     d["norms"].append(norm)
                     d["rmses"].append(rmse)
                     d["psnrs"].append(psnr)
+                    if rt is not None:
+                        d["rts"].append(rt)
                     success_norms.append(norm)
                     success_rmses.append(rmse)
                 reasons[reason] += 1
@@ -312,12 +333,6 @@ def parse_log(path: str) -> dict:
                 if current_task_id is not None:
                     chal = challenges_detailed.get(current_task_id)
                     if chal is not None:
-                        # Pull response_time_ms from the preceding verify line ONLY for
-                        # status==200 rows. Other statuses skip verify_and_score in the
-                        # validator, so no rt is available.
-                        rt = pending_verify_rt if status == 200 else None
-                        if status == 200:
-                            pending_verify_rt = None
                         chal["results"].append(
                             {
                                 "uid": uid,
@@ -358,6 +373,9 @@ def parse_log(path: str) -> dict:
                 ),
                 "avg_psnr_success": (
                     statistics.mean(d["psnrs"]) if d["psnrs"] else None
+                ),
+                "avg_rt_ms_success": (
+                    statistics.mean(d["rts"]) if d["rts"] else None
                 ),
                 "processed_total": d["processed"],
                 "last_status": d["last_status"],
@@ -496,6 +514,100 @@ def parse_log(path: str) -> dict:
     # Sort newest first by block (block is monotonically increasing).
     challenges_list.sort(key=lambda c: (c["block"] is None, -(c["block"] or 0)))
 
+    # ── Live leaderboard ────────────────────────────────────────────────────
+    # Simulate the validator's _set_weights() on the data we've captured so
+    # far. Eligible (≥50 samples) uids are sorted first by avg(last 50);
+    # non-eligible uids with ≥1 sample are appended after, sorted by the avg
+    # of whatever samples they have. Non-eligible uids never get emission.
+    def _compute_avg(scores: list[float]) -> float:
+        if not scores:
+            return 0.0
+        tail = scores[-HISTORY_SIZE:]
+        return sum(tail) / len(tail)
+
+    def _bucketed_snapshot(scores_by_uid, processed_by_uid):
+        """Return [(uid, avg, eligible), ...] sorted: eligible first by avg desc,
+        then non-eligible by avg desc."""
+        elig, non_elig = [], []
+        for uid_, scores in scores_by_uid.items():
+            if not scores:
+                continue
+            is_elig = (
+                processed_by_uid.get(uid_, 0) >= HISTORY_SIZE
+                and len(scores) >= HISTORY_SIZE
+            )
+            avg = _compute_avg(scores)
+            (elig if is_elig else non_elig).append((uid_, avg))
+        elig.sort(key=lambda t: (-t[1], t[0]))
+        non_elig.sort(key=lambda t: (-t[1], t[0]))
+        return [(u, a, True) for u, a in elig] + [(u, a, False) for u, a in non_elig]
+
+    cur_scores_by_uid    = {u: d["scores"]    for u, d in per_uid.items()}
+    cur_processed_by_uid = {u: d["processed"] for u, d in per_uid.items()}
+    live_snapshot = _bucketed_snapshot(cur_scores_by_uid, cur_processed_by_uid)
+
+    # ── Previous-snapshot leaderboard ──────────────────────────────────────
+    # Same logic but with the most recent challenge's contributions removed,
+    # so we can compute each uid's rank-change-since-previous-challenge.
+    sorted_chals = sorted(
+        challenges_detailed.values(),
+        key=lambda c: (c.get("block") or 0),
+    )
+    last_chal_uids: set[int] = set()
+    if sorted_chals:
+        last_chal_uids = {r["uid"] for r in sorted_chals[-1]["results"]}
+    prev_scores_by_uid: dict[int, list[float]] = {}
+    prev_processed_by_uid: dict[int, int] = {}
+    for uid_, d in per_uid.items():
+        scores = d["scores"]
+        processed = d["processed"]
+        if uid_ in last_chal_uids:
+            scores = scores[:-1]
+            processed = max(0, processed - 1)
+        prev_scores_by_uid[uid_] = scores
+        prev_processed_by_uid[uid_] = processed
+    prev_snapshot = _bucketed_snapshot(prev_scores_by_uid, prev_processed_by_uid)
+    prev_uid_to_rank = {uid_: i + 1 for i, (uid_, _, _) in enumerate(prev_snapshot)}
+
+    live_leaderboard: list[dict] = []
+    live_eligible_count = sum(1 for _, _, e in live_snapshot if e)
+    for rank0, (uid, avg, is_elig) in enumerate(live_snapshot):
+        rank = rank0 + 1
+        # Winner-take-all only goes to the first ELIGIBLE uid (rank 1 and eligible).
+        emission = 1.0 if (rank == 1 and is_elig) else 0.0
+        prev_rank = prev_uid_to_rank.get(uid)
+        rank_change = (prev_rank - rank) if prev_rank is not None else None
+        d = per_uid[uid]
+        live_leaderboard.append(
+            {
+                "rank": rank,
+                "uid": uid,
+                "avg100": avg,
+                "emission_raw": emission,
+                "emission": emission,
+                "eligible": is_elig,
+                "samples_captured": len(d["scores"]),
+                "samples_window": d["n"],
+                "last_reason_window": d["last_reason"],
+                "avg_norm_success": (
+                    statistics.mean(d["norms"][-HISTORY_SIZE:]) if d["norms"] else None
+                ),
+                "avg_rmse_success": (
+                    statistics.mean(d["rmses"][-HISTORY_SIZE:]) if d["rmses"] else None
+                ),
+                "avg_psnr_success": (
+                    statistics.mean(d["psnrs"][-HISTORY_SIZE:]) if d["psnrs"] else None
+                ),
+                "avg_rt_ms_success": (
+                    statistics.mean(d["rts"][-HISTORY_SIZE:]) if d["rts"] else None
+                ),
+                "history_window": HISTORY_SIZE,
+                "samples_in_window": min(len(d["rmses"]), HISTORY_SIZE),
+                "prev_rank": prev_rank,
+                "rank_change": rank_change,
+            }
+        )
+
     # Surface the latest authoritative validator ranking as a top-level field.
     latest_weight_event = weight_events[-1] if weight_events else None
     validator_leaderboard: list[dict] = []
@@ -506,15 +618,28 @@ def parse_log(path: str) -> dict:
             enriched = dict(entry)
             enriched["samples_window"] = d["n"] if d else 0
             enriched["last_reason_window"] = d["last_reason"] if d else None
+            # Mirror the validator's rolling window (last HISTORY_SIZE samples)
+            # so these averages line up conceptually with `avg100`.
             enriched["avg_norm_success"] = (
-                statistics.mean(d["norms"]) if d and d["norms"] else None
+                statistics.mean(d["norms"][-HISTORY_SIZE:]) if d and d["norms"] else None
             )
             enriched["avg_rmse_success"] = (
-                statistics.mean(d["rmses"]) if d and d["rmses"] else None
+                statistics.mean(d["rmses"][-HISTORY_SIZE:]) if d and d["rmses"] else None
             )
             enriched["avg_psnr_success"] = (
-                statistics.mean(d["psnrs"]) if d and d["psnrs"] else None
+                statistics.mean(d["psnrs"][-HISTORY_SIZE:]) if d and d["psnrs"] else None
             )
+            enriched["avg_rt_ms_success"] = (
+                statistics.mean(d["rts"][-HISTORY_SIZE:]) if d and d["rts"] else None
+            )
+            enriched["history_window"] = HISTORY_SIZE
+            enriched["samples_in_window"] = min(
+                len(d["rmses"]) if d else 0, HISTORY_SIZE
+            )
+            # In the validator's set_weights pass, only eligible uids (≥50 scores
+            # in the rolling history) get a non-zero avg100. Everyone else is
+            # logged with avg100=0.000000 and rank in trailing order.
+            enriched["eligible"] = entry.get("avg100", 0) > 0
             validator_leaderboard.append(enriched)
         # Already sorted by rank ascending in the log, but be explicit.
         validator_leaderboard.sort(key=lambda r: r["rank"])
@@ -551,6 +676,8 @@ def parse_log(path: str) -> dict:
         ),
         "weight_events_count": len(weight_events),
         "set_weight_events": set_weight_events[-10:],  # most recent 10
+        "live_leaderboard": live_leaderboard,
+        "live_eligible_count": live_eligible_count,
         "current_epoch": {
             "since_ts": last_setweights_ts,
             "challenges_count": current_epoch_challenges,
@@ -648,7 +775,10 @@ INDEX_HTML = r"""<!doctype html>
     table.clickable tbody tr.detail-row:hover > td { background: var(--bg); }
     .detail-meta { color: var(--muted); margin-bottom: 8px; font-size: 12px; }
     .detail-meta b { color: var(--text); font-weight: 500; }
-    .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+    .pager { display: flex; align-items: center; gap: 8px; margin-top: 10px; margin-bottom: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+    /* Pagers that sit above inner detail tables get a subtle band so they
+       don't get lost in the visual flow of the expanded panel. */
+    .detail-scroll > .pager { margin-top: 4px; margin-bottom: 12px; padding: 6px 8px; background: var(--panel-2); border-radius: 4px; }
     .pager button { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 3px 9px; font: inherit; cursor: pointer; min-width: 28px; }
     .pager button:hover:not(:disabled) { background: var(--border); }
     .pager button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -663,6 +793,29 @@ INDEX_HTML = r"""<!doctype html>
     .filter-bar .filter-label { color: var(--muted); }
     .filter-bar .filter-stats { color: var(--muted); margin-left: 8px; }
     tr.filtered-out { display: none !important; }
+    td.best { color: var(--good); font-weight: 600; }
+    .delta-good { color: var(--good); margin-left: 4px; font-size: 11px; }
+    .delta-bad  { color: var(--bad);  margin-left: 4px; font-size: 11px; }
+    .delta-muted{ color: var(--muted);margin-left: 4px; font-size: 11px; }
+    .tab-bar { display: flex; gap: 2px; margin-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .tab { background: transparent; color: var(--muted); border: none; border-bottom: 2px solid transparent; padding: 8px 16px; font: inherit; cursor: pointer; }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-panel[hidden] { display: none; }
+    /* Containment for the inner detail tables so a wide table can scroll
+       horizontally inside its <td> instead of stretching the parent table. */
+    .winner-tag { font-size: 11px; color: var(--muted); margin-left: 4px; font-variant-numeric: tabular-nums; }
+    .winner-tag.is-me { color: var(--good); font-weight: 600; }
+    /* Non-eligible row styling: dimmed, with a clear inline NE marker. */
+    table tbody tr.not-eligible td { color: var(--muted); }
+    table tbody tr.not-eligible td b { color: var(--muted); font-weight: 500; }
+    .not-eligible-tag { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 8px; background: rgba(255,167,38,0.08); color: var(--warn); font-size: 10px; font-weight: 500; }
+    .detail-scroll { overflow-x: auto; max-width: 100%; }
+    .detail-scroll table { width: max-content; min-width: 100%; }
+    /* Force the parent ranking/challenges tables to a stable layout so an
+       expanded detail row never forces parent columns to widen. */
+    table#val-table, table#val-table-live, table#challenges-table { table-layout: auto; }
+    .card { min-width: 0; }
     .bar { height: 14px; background: var(--panel-2); border-radius: 3px; position: relative; overflow: hidden; }
     .bar > div { height: 100%; background: var(--accent); }
     .bar.good > div { background: var(--good); }
@@ -708,6 +861,13 @@ function fmtNum(n, d=4) {
   if (n === null || n === undefined) return "—";
   if (typeof n !== "number") return String(n);
   return n.toFixed(d);
+}
+// Display 0–1 score values on a 0–100 scale so they read intuitively
+// ("96.13" instead of "0.9613"). Underlying data and sort keys stay 0–1.
+function fmtScore(s, d=2) {
+  if (s === null || s === undefined) return "—";
+  if (typeof s !== "number") return String(s);
+  return (s * 100).toFixed(d);
 }
 function pct(n) {
   if (n === null || n === undefined) return "—";
@@ -766,7 +926,7 @@ function renderChallenges(challenges) {
   html += `<table class="sortable clickable" id="challenges-table"><thead><tr>
     <th>block</th><th>task id</th><th>ts</th><th>prompt</th><th>ε</th>
     <th>responses</th><th>succ</th><th>succ%</th>
-    <th>avg score</th><th>max score</th><th>avg L∞ (succ)</th><th>avg RT (ms)</th>
+    <th>avg score ×100</th><th>max score ×100</th><th>avg L∞ (succ)</th><th>avg RT (ms)</th>
   </tr></thead><tbody>`;
   for (const c of challengeData) {
     const sr = c.total_responses > 0 ? c.success_count / c.total_responses : 0;
@@ -780,8 +940,8 @@ function renderChallenges(challenges) {
       <td class="num" data-sort="${c.total_responses}">${c.total_responses}</td>
       <td class="num" data-sort="${c.success_count}">${c.success_count}</td>
       <td class="num" data-sort="${sr}">${pct(sr)}</td>
-      <td class="num" data-sort="${c.avg_score}">${c.avg_score.toFixed(4)}</td>
-      <td class="num" data-sort="${c.max_score}">${c.max_score.toFixed(4)}</td>
+      <td class="num" data-sort="${c.avg_score}">${fmtScore(c.avg_score, 2)}</td>
+      <td class="num" data-sort="${c.max_score}">${fmtScore(c.max_score, 2)}</td>
       <td class="num" data-sort="${c.avg_norm_success ?? ''}">${fmtNum(c.avg_norm_success, 5)}</td>
       <td class="num" data-sort="${c.avg_response_time_ms ?? ''}">${c.avg_response_time_ms != null ? c.avg_response_time_ms.toFixed(0) : "—"}</td>
     </tr>`;
@@ -803,7 +963,7 @@ function renderChallengeDetailRow(taskId) {
     &middot; <b>${c.success_count}/${c.total_responses}</b> succeeded
   </div>`;
   inner += `<table class="sortable" id="detail-table"><thead><tr>
-    <th>uid</th><th>status</th><th>score</th><th>reason</th>
+    <th>uid</th><th>status</th><th>score ×100</th><th>reason</th>
     <th>L∞</th><th>RMSE</th><th>SSIM</th><th>PSNR</th><th>RT (ms)</th><th>proc</th>
   </tr></thead><tbody>`;
   // Default ordering: success first (sorted by score desc), then non-success.
@@ -817,7 +977,7 @@ function renderChallengeDetailRow(taskId) {
     inner += `<tr>
       <td data-sort="${r.uid}"><b>${r.uid}</b></td>
       <td data-sort="${r.status}"><span class="pill ${statusClass(r.status)}">${r.status}</span></td>
-      <td class="num" data-sort="${r.score}">${r.score.toFixed(6)}</td>
+      <td class="num" data-sort="${r.score}">${fmtScore(r.score, 4)}</td>
       <td data-sort="${r.reason}"><span class="pill ${reasonClass(r.reason)}">${r.reason}</span></td>
       <td class="num" data-sort="${r.norm}">${fmtNum(r.norm, 5)}</td>
       <td class="num" data-sort="${r.rmse}">${fmtNum(r.rmse, 5)}</td>
@@ -828,11 +988,69 @@ function renderChallengeDetailRow(taskId) {
     </tr>`;
   }
   inner += "</tbody></table>";
-  return `<tr class="detail-row" data-task="${taskId}"><td colspan="${CHALLENGE_COLSPAN}">${inner}</td></tr>`;
+  return `<tr class="detail-row" data-task="${taskId}"><td colspan="${CHALLENGE_COLSPAN}"><div class="detail-scroll">${inner}</div></td></tr>`;
 }
 
-const VAL_COLSPAN = 4; // matches the number of <th> in the validator-side ranking table
-let selectedUid = null;  // uid of the row currently expanded in val-table
+const VAL_COLSPAN = 6; // matches the number of <th> in the validator-side ranking table
+let selectedUid = null;       // uid of the row currently expanded in either val-table
+let activeRankingTab = "epoch"; // which tab is active: "epoch" or "live"
+
+// Generic renderer for both ranking views. Pass distinct tableId + filterIds
+// so each tab has its own sort/page/filter state.
+function renderRankingTable(opts) {
+  const {
+    rows,
+    banner = "",
+    tableId,
+    filterInputId,
+    filterClearId,
+    filterStatsId,
+    emptyMessage = `<div class='muted'>No data yet.</div>`,
+    avgLabel = "avg100",
+  } = opts;
+  if (!rows || rows.length === 0) return emptyMessage;
+  // Show ALL rows including non-eligible ones (those without 50 samples yet).
+  // Non-eligible rows are already sorted to the bottom by the server and
+  // tagged with eligible=false.
+  let html = banner + `<div class="filter-bar">
+    <span class="filter-label">filter by uid:</span>
+    <input id="${filterInputId}" type="text" placeholder="e.g. 10 (substring match)" autocomplete="off">
+    <button id="${filterClearId}" title="Clear filter">clear</button>
+    <span class="filter-stats" id="${filterStatsId}"></span>
+  </div>`;
+  html += `<table class="sortable clickable" id="${tableId}"><thead><tr>
+    <th>rank</th><th>uid</th><th>${avgLabel} (×100)</th><th>emission (×100)</th>
+    <th>avg RMSE (last 50)</th><th>avg RT (ms, last 50)</th>
+  </tr></thead><tbody>`;
+  for (const r of rows) {
+    const isEligible = (r.eligible !== false);  // default true if field absent
+    const pillCls = !isEligible ? "" : (r.emission > 0 ? "good" : (r.rank <= 5 ? "warn" : ""));
+    const selectedCls = (String(r.uid) === String(selectedUid)) ? " selected" : "";
+    const rowCls = `${selectedCls.trim()} ${isEligible ? "" : "not-eligible"}`.trim();
+    let rankChange = "";
+    if (r.rank_change != null) {
+      const d = r.rank_change;
+      if      (d > 0) rankChange = ` <span class="delta-good">↑${d}</span>`;
+      else if (d < 0) rankChange = ` <span class="delta-bad">↓${Math.abs(d)}</span>`;
+      else            rankChange = ` <span class="delta-muted">↔</span>`;
+    }
+    // Non-eligible marker shown next to rank. Sample-count hint helps the user
+    // see how close that uid is to becoming eligible (e.g. "32/50").
+    const sampleHint = !isEligible && r.samples_captured != null
+      ? ` <span class="not-eligible-tag" title="needs ${'__HISTORY_SIZE__'} captured samples">NE (${r.samples_captured}/__HISTORY_SIZE__)</span>`
+      : (!isEligible ? ` <span class="not-eligible-tag">NE</span>` : "");
+    html += `<tr class="${rowCls}" data-uid="${r.uid}">
+      <td data-sort="${r.rank}"><span class="pill ${pillCls}">#${r.rank}</span>${rankChange}${sampleHint}</td>
+      <td data-sort="${r.uid}"><b>${r.uid}</b></td>
+      <td class="num" data-sort="${r.avg100}">${fmtScore(r.avg100, 4)}</td>
+      <td class="num" data-sort="${r.emission}">${fmtScore(r.emission, 2)}</td>
+      <td class="num" data-sort="${r.avg_rmse_success ?? ''}">${fmtNum(r.avg_rmse_success, 5)}</td>
+      <td class="num" data-sort="${r.avg_rt_ms_success ?? ''}">${r.avg_rt_ms_success != null ? r.avg_rt_ms_success.toFixed(0) : "—"}</td>
+    </tr>`;
+  }
+  html += "</tbody></table>";
+  return html;
+}
 
 function renderValidatorLeaderboard(rows, latestEvent, topN) {
   if (!rows || rows.length === 0) {
@@ -841,81 +1059,232 @@ function renderValidatorLeaderboard(rows, latestEvent, topN) {
       tempo (~72 minutes). Once a set_weights event has flowed through the log, this card
       will populate.</div>`;
   }
-  // Show all miners with avg100 > 0 (the rest are unranked / no rolling history).
-  // Pagination handles cutting it into pages of 20.
-  const ranked = rows.filter(r => r.avg100 > 0);
   const banner = latestEvent
     ? `<div class="muted" style="margin-bottom:8px">
-         Last set_weights @ ${latestEvent.ts || "—"} &middot;
+         <b>Frozen snapshot</b> &middot; last set_weights @ ${latestEvent.ts || "—"} &middot;
          eligible=${latestEvent.eligible} &middot;
          distributed=${latestEvent.distributed} &middot;
          ranked uids=${latestEvent.ranks_count} &middot;
-         click a row to expand per-challenge scores for that uid
+         click a row to expand per-challenge scores
        </div>`
     : "";
-  let html = banner + `<table class="sortable clickable" id="val-table"><thead><tr>
-    <th>rank</th><th>uid</th><th>avg100</th><th>emission</th>
-  </tr></thead><tbody>`;
-  for (const r of ranked) {
-    const pillCls = r.emission > 0 ? "good" : (r.rank <= 5 ? "warn" : "");
-    const selectedCls = (String(r.uid) === String(selectedUid)) ? " selected" : "";
-    html += `<tr class="${selectedCls.trim()}" data-uid="${r.uid}">
-      <td data-sort="${r.rank}"><span class="pill ${pillCls}">#${r.rank}</span></td>
-      <td data-sort="${r.uid}"><b>${r.uid}</b></td>
-      <td class="num" data-sort="${r.avg100}">${r.avg100.toFixed(6)}</td>
-      <td class="num" data-sort="${r.emission}">${r.emission.toFixed(4)}</td>
-    </tr>`;
-  }
-  html += "</tbody></table>";
-  if (ranked.length === 0) {
-    html += `<div class='muted' style="margin-top:8px">No miners with avg100 > 0 yet.</div>`;
-  }
-  return html;
+  return renderRankingTable({
+    rows, banner,
+    tableId: "val-table",
+    filterInputId: "val-filter-uid",
+    filterClearId: "val-filter-clear",
+    filterStatsId: "val-filter-stats",
+    avgLabel: "avg100",
+  });
+}
+
+function renderLiveLeaderboard(rows, eligibleCount, totalUids) {
+  const banner = `<div class="muted" style="margin-bottom:8px">
+    <b>Live</b> &middot; simulated set_weights computed right now on captured log data &middot;
+    eligible (≥__HISTORY_SIZE__ samples)=${eligibleCount}${totalUids ? ` / ${totalUids} uids seen` : ""} &middot;
+    same formula as the validator: <code>mean(last __HISTORY_SIZE__ scores)</code>, winner-take-all &middot;
+    click a row to expand per-challenge scores
+  </div>`;
+  return renderRankingTable({
+    rows, banner,
+    tableId: "val-table-live",
+    filterInputId: "val-filter-uid-live",
+    filterClearId: "val-filter-clear-live",
+    filterStatsId: "val-filter-stats-live",
+    emptyMessage: `<div class='muted'>No uids have ≥__HISTORY_SIZE__ captured scores yet. Once any uid accumulates __HISTORY_SIZE__ responses in the log window, this view will populate.</div>`,
+    avgLabel: "live avg (last 50)",
+  });
 }
 
 // Returns an HTML <tr class="detail-row"> with this uid's score across every
-// challenge captured in the log window. Inserted into val-table tbody right
-// after the uid's data row.
-function renderUidDetailRow(uid) {
+// challenge captured in the log window. Inserted into val-table (or
+// val-table-live) tbody right after the uid's data row. The inner table's id
+// is namespaced by parent table id so each tab gets its own pager/sort/filter
+// state and the two tabs' expansions don't collide.
+function renderUidDetailRow(uid, parentTableId) {
+  const innerTableId = `uid-detail-table--${parentTableId || "val-table"}`;
   const matches = [];
   for (const c of challengeData) {
     const r = c.results.find(x => Number(x.uid) === Number(uid));
-    if (r) matches.push({...r, block: c.block, task_id: c.task_id, ts: c.ts, prompt: c.prompt, chal_eps: c.epsilon});
+    if (!r) continue;
+    // Compute this uid's rank within this challenge by sorting all responders'
+    // scores descending. Ties resolve by insertion order (stable sort).
+    const sorted = c.results.slice().sort((a, b) => b.score - a.score);
+    const chalRank = sorted.findIndex(x => Number(x.uid) === Number(uid)) + 1;
+    const chalMaxScore = sorted.length ? sorted[0].score : 0;
+    // Per-challenge min/2nd-min RMSE and RT — only successful rows participate
+    // since failures don't have meaningful values. We need both the leader and
+    // runner-up so the delta cell can compare appropriately.
+    const succResults = c.results.filter(x => x.reason === "success");
+    const rmseSorted  = succResults.slice().sort((a, b) => a.rmse - b.rmse);
+    const rtsSucc     = succResults.filter(x => x.response_time_ms != null);
+    const rtSorted    = rtsSucc.slice().sort((a, b) => a.response_time_ms - b.response_time_ms);
+    const chalMinRmse       = rmseSorted.length ? rmseSorted[0].rmse : null;
+    const chalSecondMinRmse = rmseSorted.length > 1 ? rmseSorted[1].rmse : null;
+    const chalMinRt         = rtSorted.length ? rtSorted[0].response_time_ms : null;
+    const chalSecondMinRt   = rtSorted.length > 1 ? rtSorted[1].response_time_ms : null;
+    // For score: 2nd best comes from the same sort used for rank.
+    const chalSecondScore = sorted.length > 1 ? sorted[1].score : null;
+    // Per-metric winner UIDs. In case of ties, the winner is attributed to
+    // THIS uid (the one whose detail row we're rendering) so that "I'm tied
+    // for first" reads as "I won". Other tied uids viewing the same challenge
+    // would see themselves credited in their own detail view.
+    const myUid = Number(uid);
+    const maxScore = sorted.length ? sorted[0].score : null;
+    const scoreTied = sorted.filter(x => x.score === maxScore);
+    const chalScoreWinnerUid = scoreTied.some(x => Number(x.uid) === myUid)
+      ? myUid : (scoreTied[0]?.uid ?? null);
+    const rmseTied = rmseSorted.filter(x => x.rmse === chalMinRmse);
+    const chalRmseWinnerUid = rmseTied.some(x => Number(x.uid) === myUid)
+      ? myUid : (rmseTied[0]?.uid ?? null);
+    const rtTied = rtSorted.filter(x => x.response_time_ms === chalMinRt);
+    const chalRtWinnerUid = rtTied.some(x => Number(x.uid) === myUid)
+      ? myUid : (rtTied[0]?.uid ?? null);
+    // Runner-up uid for each metric = the next ranked uid in sort order that
+    // ISN'T this uid. Used so that when this uid wins a metric, we display
+    // the next-best uid instead of pointlessly showing this uid back at them.
+    function nextDistinctUid(sortedList, me) {
+      for (const x of sortedList) {
+        if (Number(x.uid) !== me) return Number(x.uid);
+      }
+      return null;
+    }
+    const chalScoreRunnerUpUid = nextDistinctUid(sorted,     myUid);
+    const chalRmseRunnerUpUid  = nextDistinctUid(rmseSorted, myUid);
+    const chalRtRunnerUpUid    = nextDistinctUid(rtSorted,   myUid);
+    matches.push({
+      ...r,
+      block: c.block,
+      ts: c.ts,
+      prompt: c.prompt,
+      chal_rank: chalRank,
+      chal_max_score: chalMaxScore,
+      chal_second_score: chalSecondScore,
+      chal_min_rmse: chalMinRmse,
+      chal_second_min_rmse: chalSecondMinRmse,
+      chal_min_rt: chalMinRt,
+      chal_second_min_rt: chalSecondMinRt,
+      chal_score_winner_uid:    chalScoreWinnerUid,
+      chal_rmse_winner_uid:     chalRmseWinnerUid,
+      chal_rt_winner_uid:       chalRtWinnerUid,
+      chal_score_runnerup_uid:  chalScoreRunnerUpUid,
+      chal_rmse_runnerup_uid:   chalRmseRunnerUpUid,
+      chal_rt_runnerup_uid:     chalRtRunnerUpUid,
+      chal_total_responses: c.total_responses,
+    });
   }
   matches.sort((a, b) => (b.block || 0) - (a.block || 0));
-  const succ = matches.filter(r => r.reason === "success").length;
+  // Stamp a stable per-row id (1 = most recent challenge for this uid).
+  // Stays attached to the same row even after the user sorts by other columns.
+  matches.forEach((m, i) => { m.row_id = i + 1; });
+  const succ = matches.filter(r => r.reason === "success");
+  const wins = matches.filter(r => r.chal_rank === 1 && r.reason === "success").length;
+
   let inner = `<div class="detail-meta"><b>uid ${uid}</b>
     &middot; appeared in <b>${matches.length}</b> challenge(s) in this log window
-    &middot; <b>${succ}</b> success(es)
+    &middot; <b>${succ.length}</b> success(es)
+    &middot; <b>${wins}</b> win(s) (rank #1)
   </div>`;
   if (matches.length === 0) {
     inner += `<div class='muted'>This uid did not appear in any captured challenge.</div>`;
     return `<tr class="detail-row" data-uid="${uid}"><td colspan="${VAL_COLSPAN}">${inner}</td></tr>`;
   }
-  inner += `<table class="sortable" id="uid-detail-table"><thead><tr>
-    <th>block</th><th>task id</th><th>ts</th><th>prompt</th><th>ε</th>
-    <th>status</th><th>score</th><th>reason</th>
-    <th>L∞</th><th>RMSE</th><th>SSIM</th><th>PSNR</th><th>RT (ms)</th>
+  // Format a delta into a colored badge. positive = green (we're ahead),
+  // negative = red (we're behind), null = "—". `decimals` controls precision.
+  // For "lower is better" metrics (rmse, rt), pass the delta as
+  // (other_value - our_value) so the sign convention stays "+ good, - bad".
+  function deltaBadge(delta, decimals, fixed) {
+    if (delta == null) return `<span class="delta-muted">(—)</span>`;
+    if (delta === 0) return `<span class="delta-muted">(±0)</span>`;
+    const cls = delta > 0 ? "delta-good" : "delta-bad";
+    const sign = delta > 0 ? "+" : "";
+    const str = fixed ? delta.toFixed(decimals) : Math.round(delta).toString();
+    return `<span class="${cls}">(${sign}${str})</span>`;
+  }
+
+  inner += `<table class="sortable" id="${innerTableId}"><thead><tr>
+    <th>#</th><th>block</th><th>ts</th><th>prompt</th>
+    <th>score ×100 (Δ, winner)</th><th>rank</th><th>reason</th>
+    <th>L∞</th><th>RMSE (Δ, winner)</th><th>SSIM</th><th>PSNR</th><th>RT ms (Δ, winner)</th>
   </tr></thead><tbody>`;
   for (const r of matches) {
+    const rankCls   = r.reason !== "success" ? "" : (r.chal_rank === 1 ? "good" : "warn");
+    const rankLabel = r.reason !== "success" ? "—" : `#${r.chal_rank}/${r.chal_total_responses}`;
+    // Compute deltas only for success rows.
+    let scoreDelta = null, rmseDelta = null, rtDelta = null;
+    if (r.reason === "success") {
+      // Score: higher = better. "+" when leader (gap above 2nd), "-" when not (gap below #1).
+      if (r.chal_rank === 1 && r.chal_second_score != null) {
+        scoreDelta = r.score - r.chal_second_score;
+      } else if (r.chal_rank !== 1) {
+        scoreDelta = r.score - r.chal_max_score;
+      }
+      // RMSE: lower = better.
+      const isMinRmse = (r.chal_min_rmse != null && r.rmse === r.chal_min_rmse);
+      if (isMinRmse && r.chal_second_min_rmse != null) {
+        rmseDelta = r.chal_second_min_rmse - r.rmse;       // positive: we're lower
+      } else if (!isMinRmse && r.chal_min_rmse != null) {
+        rmseDelta = r.chal_min_rmse - r.rmse;              // negative: we're higher
+      }
+      // RT: lower = better.
+      const isMinRt = (r.chal_min_rt != null && r.response_time_ms === r.chal_min_rt);
+      if (r.response_time_ms != null) {
+        if (isMinRt && r.chal_second_min_rt != null) {
+          rtDelta = r.chal_second_min_rt - r.response_time_ms;
+        } else if (!isMinRt && r.chal_min_rt != null) {
+          rtDelta = r.chal_min_rt - r.response_time_ms;
+        }
+      }
+    }
+
+    // Per-metric inline reference uid. When THIS uid is the winner of a
+    // metric, show the RUNNER-UP uid instead (so we see who we're beating).
+    // When THIS uid is not the winner, show the winner uid (so we see who
+    // beat us). Always rendered in muted grey — the delta sign already
+    // conveys whether the reference is below us (+) or above us (-).
+    const meIsScoreWinner = r.chal_score_winner_uid != null && Number(r.chal_score_winner_uid) === Number(uid);
+    const meIsRmseWinner  = r.chal_rmse_winner_uid  != null && Number(r.chal_rmse_winner_uid)  === Number(uid);
+    const meIsRtWinner    = r.chal_rt_winner_uid    != null && Number(r.chal_rt_winner_uid)    === Number(uid);
+    function refBadge(uidToShow) {
+      if (uidToShow == null) return "";
+      return ` <span class="winner-tag">#${uidToShow}</span>`;
+    }
+    const scoreRefUid = meIsScoreWinner ? r.chal_score_runnerup_uid : r.chal_score_winner_uid;
+    const rmseRefUid  = meIsRmseWinner  ? r.chal_rmse_runnerup_uid  : r.chal_rmse_winner_uid;
+    const rtRefUid    = meIsRtWinner    ? r.chal_rt_runnerup_uid    : r.chal_rt_winner_uid;
+    const isMinRmse = meIsRmseWinner;
+    const isMinRt   = meIsRtWinner;
+    const scoreCell = r.reason === "success"
+      ? `${fmtScore(r.score, 4)} ${deltaBadge(scoreDelta != null ? scoreDelta * 100 : null, 2, true)}${refBadge(scoreRefUid)}`
+      : fmtScore(r.score, 4);
+    const rmseCell = r.reason === "success"
+      ? `${fmtNum(r.rmse, 5)} ${deltaBadge(rmseDelta, 5, true)}${refBadge(rmseRefUid)}`
+      : fmtNum(r.rmse, 5);
+    const rtCell = (r.reason === "success" && r.response_time_ms != null)
+      ? `${r.response_time_ms} ${deltaBadge(rtDelta, 0, false)}${refBadge(rtRefUid)}`
+      : (r.response_time_ms != null ? String(r.response_time_ms) : "—");
+
     inner += `<tr>
+      <td class="num muted" data-sort="${r.row_id}">${r.row_id}</td>
       <td data-sort="${r.block ?? 0}"><b>${r.block ?? "—"}</b></td>
-      <td data-sort="${r.task_id || ''}" title="${r.task_id || ''}" style="font-size:11px; max-width: 220px; overflow:hidden; text-overflow: ellipsis;">${r.task_id || "—"}</td>
       <td data-sort="${r.ts || ''}">${r.ts || "—"}</td>
       <td data-sort="${r.prompt || ''}">${r.prompt || "—"}</td>
-      <td class="num" data-sort="${r.chal_eps ?? ''}">${fmtNum(r.chal_eps, 4)}</td>
-      <td data-sort="${r.status}"><span class="pill ${statusClass(r.status)}">${r.status}</span></td>
-      <td class="num" data-sort="${r.score}">${r.score.toFixed(6)}</td>
+      <td class="num" data-sort="${r.score}">${scoreCell}</td>
+      <td class="num" data-sort="${r.reason === 'success' ? r.chal_rank : 9999}">
+        ${r.reason === 'success' ? `<span class="pill ${rankCls}">${rankLabel}</span>` : rankLabel}
+      </td>
       <td data-sort="${r.reason}"><span class="pill ${reasonClass(r.reason)}">${r.reason}</span></td>
       <td class="num" data-sort="${r.norm}">${fmtNum(r.norm, 5)}</td>
-      <td class="num" data-sort="${r.rmse}">${fmtNum(r.rmse, 5)}</td>
+      <td class="num${isMinRmse ? ' best' : ''}" data-sort="${r.rmse}">${rmseCell}</td>
       <td class="num" data-sort="${r.ssim}">${fmtNum(r.ssim, 4)}</td>
       <td class="num" data-sort="${r.psnr_db}">${fmtNum(r.psnr_db, 2)}</td>
-      <td class="num" data-sort="${r.response_time_ms ?? ''}">${r.response_time_ms ?? "—"}</td>
+      <td class="num${isMinRt ? ' best' : ''}" data-sort="${r.response_time_ms ?? ''}">${rtCell}</td>
     </tr>`;
   }
   inner += "</tbody></table>";
-  return `<tr class="detail-row" data-uid="${uid}"><td colspan="${VAL_COLSPAN}">${inner}</td></tr>`;
+  // Wrap in overflow-x:auto so a wide inner table scrolls horizontally
+  // inside its td rather than stretching the parent table's column widths.
+  return `<tr class="detail-row" data-uid="${uid}"><td colspan="${VAL_COLSPAN}"><div class="detail-scroll">${inner}</div></td></tr>`;
 }
 
 function render(s) {
@@ -931,7 +1300,16 @@ function render(s) {
     <div class="grid">
       <div class="card span-12">
         <h2>set_weights ranking</h2>
-        ${renderValidatorLeaderboard(s.validator_leaderboard, s.latest_weight_event, topN)}
+        <div class="tab-bar">
+          <button class="tab" data-tab="epoch">epoch (from log)</button>
+          <button class="tab" data-tab="live">live (computed now)</button>
+        </div>
+        <div class="tab-panel" data-panel="epoch">
+          ${renderValidatorLeaderboard(s.validator_leaderboard, s.latest_weight_event, topN)}
+        </div>
+        <div class="tab-panel" data-panel="live" hidden>
+          ${renderLiveLeaderboard(s.live_leaderboard || [], s.live_eligible_count || 0, s.miner_count || 0)}
+        </div>
       </div>
 
       <div class="card span-12">
@@ -968,6 +1346,14 @@ function applyFilter(table) {
     for (const r of dataRows) {
       const blockText = (r.cells[0]?.textContent || "").trim();
       const match = !q || blockText.includes(q);
+      r.classList.toggle("filtered-out", !match);
+    }
+  } else if (tid === "val-table" || tid === "val-table-live") {
+    const q = (fs.uid || "").trim();
+    for (const r of dataRows) {
+      // uid is column index 1 (rank | uid | avg100 | emission | RMSE | RT).
+      const uidText = (r.cells[1]?.textContent || "").trim();
+      const match = !q || uidText.includes(q);
       r.classList.toggle("filtered-out", !match);
     }
   } else {
@@ -1126,6 +1512,16 @@ function applyPagination(table) {
         ? `${total} of ${allTotal} match "${q}"`
         : "";
     }
+  } else if (tid === "val-table" || tid === "val-table-live") {
+    const statsId = tid === "val-table" ? "val-filter-stats" : "val-filter-stats-live";
+    const stats = document.getElementById(statsId);
+    if (stats) {
+      const fs = filterState[tid];
+      const q = fs && fs.uid ? fs.uid.trim() : "";
+      stats.textContent = q
+        ? `${total} of ${allTotal} match "${q}"`
+        : "";
+    }
   }
 }
 
@@ -1166,7 +1562,11 @@ function expandChallengeRow(dataRow) {
   dataRow.classList.add("selected");
   dataRow.insertAdjacentHTML("afterend", renderChallengeDetailRow(taskId));
   const det = document.getElementById("detail-table");
-  if (det) wireSortable(det);
+  if (det) {
+    wireSortable(det);
+    const pager = document.getElementById(`pager-${det.id}`);
+    if (pager && det.parentNode) det.parentNode.insertBefore(pager, det);
+  }
 }
 
 function collapseChallengeRow(dataRow) {
@@ -1200,13 +1600,21 @@ function wireChallengeClicks() {
 function expandUidRow(dataRow) {
   const uid = dataRow.dataset.uid;
   if (!uid) return;
+  const parentTable = dataRow.closest("table");
+  const parentTableId = parentTable ? parentTable.id : "val-table";
+  const innerTableId  = `uid-detail-table--${parentTableId}`;
   const tbody = dataRow.parentNode;
   Array.from(tbody.querySelectorAll(":scope > tr.detail-row")).forEach(d => d.remove());
   Array.from(tbody.querySelectorAll(":scope > tr.selected")).forEach(x => x.classList.remove("selected"));
   dataRow.classList.add("selected");
-  dataRow.insertAdjacentHTML("afterend", renderUidDetailRow(parseInt(uid, 10)));
-  const det = document.getElementById("uid-detail-table");
-  if (det) wireSortable(det);
+  dataRow.insertAdjacentHTML("afterend", renderUidDetailRow(parseInt(uid, 10), parentTableId));
+  const det = document.getElementById(innerTableId);
+  if (det) {
+    wireSortable(det);
+    // Move the pager above the inner table so it's immediately visible.
+    const pager = document.getElementById(`pager-${det.id}`);
+    if (pager && det.parentNode) det.parentNode.insertBefore(pager, det);
+  }
 }
 
 function collapseUidRow(dataRow) {
@@ -1216,24 +1624,28 @@ function collapseUidRow(dataRow) {
 }
 
 function wireValClicks() {
-  const t = document.getElementById("val-table");
-  if (!t) return;
-  Array.from(t.querySelectorAll("tbody tr:not(.detail-row)")).forEach(tr => {
-    tr.addEventListener("click", () => {
-      const uid = tr.dataset.uid;
-      if (!uid) return;
-      const next = tr.nextElementSibling;
-      const isExpanded = next && next.classList.contains("detail-row") && next.dataset.uid === uid;
-      if (isExpanded) {
-        collapseUidRow(tr);
-        selectedUid = null;
-      } else {
-        expandUidRow(tr);
-        selectedUid = uid;
-      }
-      applyPagination(t);
+  // Both the epoch ranking table and the live ranking table get the same
+  // expand-on-click treatment.
+  for (const tid of ["val-table", "val-table-live"]) {
+    const t = document.getElementById(tid);
+    if (!t) continue;
+    Array.from(t.querySelectorAll("tbody tr:not(.detail-row)")).forEach(tr => {
+      tr.addEventListener("click", () => {
+        const uid = tr.dataset.uid;
+        if (!uid) return;
+        const next = tr.nextElementSibling;
+        const isExpanded = next && next.classList.contains("detail-row") && next.dataset.uid === uid;
+        if (isExpanded) {
+          collapseUidRow(tr);
+          selectedUid = null;
+        } else {
+          expandUidRow(tr);
+          selectedUid = uid;
+        }
+        applyPagination(t);
+      });
     });
-  });
+  }
 }
 
 function wireChallengeFilter() {
@@ -1269,11 +1681,65 @@ function wireChallengeFilter() {
   }
 }
 
+function wireValFilter() {
+  const setups = [
+    { inputId: "val-filter-uid",      clearId: "val-filter-clear",      tid: "val-table" },
+    { inputId: "val-filter-uid-live", clearId: "val-filter-clear-live", tid: "val-table-live" },
+  ];
+  for (const { inputId, clearId, tid } of setups) {
+    const input = document.getElementById(inputId);
+    const clear = document.getElementById(clearId);
+    const t = document.getElementById(tid);
+    if (!input || !t) continue;
+    const savedQ = (filterState[tid] && filterState[tid].uid) || "";
+    if (input.value !== savedQ) input.value = savedQ;
+    input.addEventListener("input", () => {
+      const fs = filterState[tid] || {};
+      fs.uid = input.value;
+      filterState[tid] = fs;
+      const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+      ps.page = 1;
+      pageState[tid] = ps;
+      refreshTable(t);
+    });
+    if (clear) {
+      clear.addEventListener("click", () => {
+        input.value = "";
+        const fs = filterState[tid] || {};
+        fs.uid = "";
+        filterState[tid] = fs;
+        const ps = pageState[tid] || { page: 1, size: DEFAULT_PAGE_SIZE };
+        ps.page = 1;
+        pageState[tid] = ps;
+        refreshTable(t);
+        input.focus();
+      });
+    }
+  }
+}
+
+function wireTabs() {
+  // Apply current tab state (persisted across re-renders).
+  const tabs = document.querySelectorAll(".tab");
+  const panels = document.querySelectorAll(".tab-panel");
+  const setActive = (name) => {
+    activeRankingTab = name;
+    tabs.forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+    panels.forEach(p => { p.hidden = p.dataset.panel !== name; });
+  };
+  tabs.forEach(tab => {
+    tab.addEventListener("click", () => setActive(tab.dataset.tab));
+  });
+  setActive(activeRankingTab);
+}
+
 function rewireAll() {
   document.querySelectorAll("table.sortable").forEach(wireSortable);
   wireChallengeClicks();
   wireValClicks();
   wireChallengeFilter();
+  wireValFilter();
+  wireTabs();
   // Restore previously expanded challenge.
   if (selectedTaskId) {
     const t = document.getElementById("challenges-table");
@@ -1284,19 +1750,31 @@ function rewireAll() {
       applyPagination(t);
     }
   }
-  // Restore previously expanded uid.
+  // Restore previously expanded uid (in whichever val-table is currently
+  // visible). The other table will pick it up if the user switches tabs.
   if (selectedUid) {
-    const t = document.getElementById("val-table");
-    if (t) {
+    let restored = false;
+    for (const tid of ["val-table", "val-table-live"]) {
+      const t = document.getElementById(tid);
+      if (!t) continue;
       const row = t.querySelector(`tbody tr[data-uid="${selectedUid}"]:not(.detail-row)`);
-      if (row) expandUidRow(row);
-      else selectedUid = null;
-      applyPagination(t);
+      if (row) {
+        expandUidRow(row);
+        applyPagination(t);
+        restored = true;
+      }
     }
+    if (!restored) selectedUid = null;
   }
 }
 
 async function fetchStats(force) {
+  // Don't blow away the user's typing during a 30s auto-refresh.
+  // Manual "Refresh now" (force=true) still proceeds.
+  if (!force && document.activeElement && document.activeElement.tagName === "INPUT") {
+    nextRefreshAt = Date.now() + REFRESH_MS;
+    return;
+  }
   const btn = document.getElementById("refresh");
   btn.disabled = true;
   btn.textContent = "Refreshing…";
@@ -1334,9 +1812,10 @@ const RECENT_LOOPS_DEFAULT = __RECENT_LOOPS__;
 
 def make_handler(cache: StatsCache, top_n: int, recent_loops: int):
     rendered_index = (
-        INDEX_HTML.replace("__TOP_N__", str(top_n)).replace(
-            "__RECENT_LOOPS__", str(recent_loops)
-        )
+        INDEX_HTML
+        .replace("__TOP_N__", str(top_n))
+        .replace("__RECENT_LOOPS__", str(recent_loops))
+        .replace("__HISTORY_SIZE__", str(HISTORY_SIZE))
     ).encode("utf-8")
 
     class Handler(BaseHTTPRequestHandler):
@@ -1345,9 +1824,21 @@ def make_handler(cache: StatsCache, top_n: int, recent_loops: int):
             print(f"{self.address_string()} - {fmt % args}", flush=True)
 
         def _send(self, status: int, body: bytes, content_type: str) -> None:
+            # gzip-compress large text bodies when the client accepts it.
+            # Saves an order of magnitude on the /api/stats response (~23 MB → ~2 MB).
+            accept_enc = self.headers.get("Accept-Encoding", "") or ""
+            encoding = None
+            if "gzip" in accept_enc and len(body) > 1024 and content_type.startswith(
+                ("application/json", "text/", "text/html")
+            ):
+                body = gzip.compress(body, compresslevel=6)
+                encoding = "gzip"
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if encoding:
+                self.send_header("Content-Encoding", encoding)
+                self.send_header("Vary", "Accept-Encoding")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
