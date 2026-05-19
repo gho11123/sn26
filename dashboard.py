@@ -36,48 +36,107 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 
+# MINER_RE matches the per-uid response line in BOTH log formats:
+#   OLD: "uid=N status=N score=N processed=N reason=R norm=N ..."
+#        (preceded by a timestamp prefix and a separate verify_and_score line)
+#   NEW: "uid=N status=N score=N response_time_ms=N processed=N reason=R norm=N ..."
+#        (no timestamp prefix; response_time_ms inlined)
+# The optional non-capturing group around response_time_ms makes both work.
 MINER_RE = re.compile(
     r"uid=(?P<uid>\d+) status=(?P<status>\d+) score=(?P<score>[\d.]+) "
+    r"(?:response_time_ms=(?P<rt_inline>\d+) )?"
     r"processed=(?P<processed>\d+) reason=(?P<reason>\w+) "
     r"norm=(?P<norm>[\d.]+) rmse=(?P<rmse>[\d.]+) epsilon=(?P<eps>[\d.]+) "
     r"ssim=(?P<ssim>[\d.]+) psnr_db=(?P<psnr>[\d.\-]+)"
 )
-LOOP_RE = re.compile(
-    r"\[run_id=(?P<run_id>[^\]]+)\] loop_summary "
-    r"block=(?P<block>\d+) selected=(?P<selected>\d+) "
-    r"success=(?P<succ>\d+)/(?P<total>\d+) "
-    r"avg_score=(?P<avg>[\d.]+) min_score=(?P<min>[\d.]+) max_score=(?P<max>[\d.]+) "
-    r"avg_norm=(?P<an>[\d.]+) avg_rmse=(?P<ar>[\d.]+) reasons=(?P<reasons>\S+)"
-)
-CHAL_RE = re.compile(
+# loop_summary line. Old format had keys in code-defined order; new validator
+# emits them alphabetically. Use independent field extraction (see
+# `_parse_loop_summary_fields` below) so both orderings work.
+LOOP_MARKER_RE = re.compile(r"\[run_id=(?P<run_id>[^\]]+)\] loop_summary\b")
+# challenge_summary line. New format only — alphabetical key order:
+#   challenge_summary epsilon=N fallback_used=B llm_verified=B prompt=W
+#                     task_id=X true_label=W
+# Independent extraction handles either ordering.
+CHAL_SUMMARY_MARKER_RE = re.compile(r"challenge_summary\b")
+# Old-style challenge announcement line (no longer emitted by the current
+# validator, but kept so we still parse historical log entries):
+#   Challenge task=X prompt=W eps=N
+CHAL_OLD_RE = re.compile(
     r"Challenge task=(?P<task>\S+) prompt=(?P<prompt>\w+) eps=(?P<eps>[\d.]+)"
+)
+# NEW: a marker that precedes the batch of per-uid lines for one challenge.
+#   miner_response_evaluations block=N count=N
+EVAL_MARKER_RE = re.compile(
+    r"miner_response_evaluations block=(?P<block>\d+) count=(?P<count>\d+)"
 )
 RESTART_RE = re.compile(r"\*\*\* RUN RESTARTED at (?P<ts>\S+)")
 
-# Validator-side authoritative ranking lines, emitted during _set_weights():
-#   rank=1 uid=10 avg100=0.945720 emission_raw=1.000000 emission=1.000000
+# Validator-side authoritative ranking lines, emitted during _set_weights().
+# The OLD format used `avg100=`; the NEW format uses `avg_score=`. Match both.
+#   rank=1 uid=10 avg100=0.945720 emission_raw=1.000000 emission=1.000000   (old)
+#   rank=1 uid=10 avg_score=0.945720 emission_raw=1.000000 emission=1.000000 (new)
 RANK_RE = re.compile(
-    r"rank=(?P<rank>\d+) uid=(?P<uid>\d+) avg100=(?P<avg100>[\d.]+) "
+    r"rank=(?P<rank>\d+) uid=(?P<uid>\d+) (?:avg100|avg_score)=(?P<avg100>[\d.]+) "
     r"emission_raw=(?P<er>[\d.]+) emission=(?P<emission>[\d.]+)"
 )
-# Summary line that closes each rank batch:
-#   [run_id=...] weights_summary eligible=230 distributed=5
-#                  top5=r1:uid10:avg=0.9457:w=1.0000|r2:uid170:avg=0.9452:w=0.0000|...
+# weights_summary line. The "top5" key was renamed to "top10" in the new
+# validator. Accept either.
 WEIGHTS_RE = re.compile(
     r"weights_summary eligible=(?P<eligible>\d+) distributed=(?P<distributed>\d+) "
-    r"top5=(?P<top5>\S+)"
+    r"top(?:5|10)=(?P<top5>\S+)"
 )
 SET_WEIGHTS_RE = re.compile(r"set_weights (?P<result>success|failed)(?::\s*(?P<msg>.+))?")
 
 # Mirrors the validator's HISTORY_SIZE (perturbnet/constants.py).
-# Used to align dashboard rolling-window aggregations with `avg100`.
 HISTORY_SIZE = 50
-# verify_and_score lines: emitted at the start of each per-uid scoring call.
-# They carry the task_id and response_time_ms that the very next uid line belongs to
-# — but only for uids whose HTTP status was 200 (status != 200 skips verify_and_score).
+# Old-format verify_and_score line. Kept for backward compatibility — the
+# current validator no longer emits these (response_time_ms is now inlined
+# directly in the per-uid line).
 VERIFY_RE = re.compile(
     r"verify_and_score task_id=(?P<task>\S+) response_time_ms=(?P<rt>\d+)"
 )
+
+def _parse_loop_summary_fields(line: str) -> dict | None:
+    """Order-independent extraction for loop_summary lines (both old and new
+    validator code orderings)."""
+    m = LOOP_MARKER_RE.search(line)
+    if not m:
+        return None
+    out: dict = {"run_id": m.group("run_id")}
+    for key, pat in (
+        ("block",    r"\bblock=(\d+)"),
+        ("selected", r"\bselected=(\d+)"),
+        ("avg",      r"\bavg_score=([\d.]+)"),
+        ("min",      r"\bmin_score=([\d.]+)"),
+        ("max",      r"\bmax_score=([\d.]+)"),
+        ("an",       r"\bavg_norm=([\d.]+)"),
+        ("ar",       r"\bavg_rmse=([\d.]+)"),
+        ("reasons",  r"\breasons=(\S+)"),
+    ):
+        mm = re.search(pat, line)
+        if mm:
+            out[key] = mm.group(1)
+    mm = re.search(r"\bsuccess=(\d+)/(\d+)", line)
+    if mm:
+        out["succ"] = mm.group(1)
+        out["total"] = mm.group(2)
+    return out if "block" in out else None
+
+
+def _parse_chal_summary_fields(line: str) -> dict | None:
+    """Order-independent extraction for the new `challenge_summary` line."""
+    if not CHAL_SUMMARY_MARKER_RE.search(line):
+        return None
+    out: dict = {}
+    for key, pat in (
+        ("task",   r"\btask_id=(\S+)"),
+        ("prompt", r"\bprompt=(\w+)"),
+        ("eps",    r"\bepsilon=([\d.]+)"),
+    ):
+        mm = re.search(pat, line)
+        if mm:
+            out[key] = mm.group(1)
+    return out if "task" in out else None
 
 # Lines we tag onto the most recently seen loop so they can be displayed
 # inline with their corresponding loop_summary.
@@ -157,23 +216,75 @@ def parse_log(path: str) -> dict:
                 restarts.append(m.group("ts"))
                 continue
 
-            m = CHAL_RE.search(line)
-            if m:
-                challenges[m.group("prompt")] += 1
-                epsilons.append(float(m.group("eps")))
-                task_id = m.group("task")
+            # Try OLD-style "Challenge task=…" first, then NEW-style
+            # "challenge_summary …" line. Both establish current_task_id and
+            # create (or refresh) the matching entry in challenges_detailed.
+            chal = None
+            mo = CHAL_OLD_RE.search(line)
+            if mo:
+                chal = {
+                    "task": mo.group("task"),
+                    "prompt": mo.group("prompt"),
+                    "eps": mo.group("eps"),
+                }
+            else:
+                cs = _parse_chal_summary_fields(line)
+                if cs:
+                    chal = cs
+            if chal:
+                task_id = chal["task"]
+                prompt = chal.get("prompt")
+                eps = chal.get("eps")
+                if prompt:
+                    challenges[prompt] += 1
+                if eps is not None:
+                    try:
+                        epsilons.append(float(eps))
+                    except ValueError:
+                        pass
                 current_task_id = task_id
                 pending_verify_rt = None
                 # task_id format: "{block}-{seed}"
                 block = task_id.split("-", 1)[0] if "-" in task_id else ""
-                challenges_detailed[task_id] = {
+                # Either create a new entry, or fill in fields on a stub that
+                # may have been created earlier (e.g. by a verify line).
+                entry = challenges_detailed.get(task_id) or {
                     "task_id": task_id,
                     "block": int(block) if block.isdigit() else None,
-                    "prompt": m.group("prompt"),
-                    "epsilon": float(m.group("eps")),
+                    "prompt": None,
+                    "epsilon": None,
                     "ts": last_line_ts,
                     "results": [],
                 }
+                entry["prompt"] = prompt or entry.get("prompt")
+                try:
+                    if eps is not None:
+                        entry["epsilon"] = float(eps)
+                except ValueError:
+                    pass
+                if not entry.get("ts"):
+                    entry["ts"] = last_line_ts
+                challenges_detailed[task_id] = entry
+                continue
+
+            # NEW: marker that immediately precedes a batch of per-uid lines.
+            # Records the block but doesn't open a challenge entry — that
+            # happened above on challenge_summary. Helps set current_task_id
+            # if challenge_summary was missed for some reason.
+            em = EVAL_MARKER_RE.search(line)
+            if em:
+                block_n = int(em.group("block"))
+                # If we already have a matching challenge open with the right
+                # block, keep current_task_id as-is. Otherwise search for a
+                # task with this block and adopt it.
+                if not (
+                    current_task_id
+                    and challenges_detailed.get(current_task_id, {}).get("block") == block_n
+                ):
+                    for tid, c in challenges_detailed.items():
+                        if c.get("block") == block_n:
+                            current_task_id = tid
+                            break
                 continue
 
             m = VERIFY_RE.search(line)
@@ -260,13 +371,12 @@ def parse_log(path: str) -> dict:
                 )
                 continue
 
-            m = LOOP_RE.search(line)
-            if m:
-                d = m.groupdict()
+            d = _parse_loop_summary_fields(line)
+            if d:
                 run_ids.add(d["run_id"])
                 # reasons field is like: success:33,above_max_delta:7,...
                 breakdown: dict[str, int] = {}
-                for chunk in d["reasons"].split(","):
+                for chunk in (d.get("reasons") or "").split(","):
                     if ":" in chunk:
                         k, v = chunk.split(":", 1)
                         try:
@@ -278,14 +388,14 @@ def parse_log(path: str) -> dict:
                         "ts": last_line_ts,
                         "run_id": d["run_id"],
                         "block": int(d["block"]),
-                        "selected": int(d["selected"]),
-                        "success": int(d["succ"]),
-                        "total": int(d["total"]),
-                        "avg": float(d["avg"]),
-                        "min": float(d["min"]),
-                        "max": float(d["max"]),
-                        "avg_norm": float(d["an"]),
-                        "avg_rmse": float(d["ar"]),
+                        "selected": int(d.get("selected", 0)),
+                        "success": int(d.get("succ", 0)),
+                        "total": int(d.get("total", 0)),
+                        "avg": float(d.get("avg", 0.0)),
+                        "min": float(d.get("min", 0.0)),
+                        "max": float(d.get("max", 0.0)),
+                        "avg_norm": float(d.get("an", 0.0)),
+                        "avg_rmse": float(d.get("ar", 0.0)),
                         "reasons": breakdown,
                     }
                 )
@@ -302,12 +412,18 @@ def parse_log(path: str) -> dict:
                 rmse = float(m.group("rmse"))
                 psnr = float(m.group("psnr"))
 
-                # Consume the response_time_ms attached to this row by the
-                # preceding verify_and_score line. Only status==200 emits that
-                # line in the validator, so non-200 rows have no rt.
-                rt = pending_verify_rt if status == 200 else None
-                if status == 200:
+                # Get response_time_ms: prefer the NEW inline value embedded
+                # in the uid line itself. Fall back to OLD-format
+                # `pending_verify_rt` (set by a preceding verify_and_score
+                # line, only for status==200 rows in the old format).
+                rt_inline_str = m.group("rt_inline")
+                if rt_inline_str is not None:
+                    rt = int(rt_inline_str)
+                elif status == 200:
+                    rt = pending_verify_rt
                     pending_verify_rt = None
+                else:
+                    rt = None
 
                 d = per_uid[uid]
                 d["n"] += 1
@@ -1014,7 +1130,7 @@ function renderRankingTable(opts) {
   // tagged with eligible=false.
   let html = banner + `<div class="filter-bar">
     <span class="filter-label">filter by uid:</span>
-    <input id="${filterInputId}" type="text" placeholder="e.g. 10 (substring match)" autocomplete="off">
+    <input id="${filterInputId}" type="text" placeholder="exact uid, e.g. 193" autocomplete="off">
     <button id="${filterClearId}" title="Clear filter">clear</button>
     <span class="filter-stats" id="${filterStatsId}"></span>
   </div>`;
@@ -1349,11 +1465,13 @@ function applyFilter(table) {
       r.classList.toggle("filtered-out", !match);
     }
   } else if (tid === "val-table" || tid === "val-table-live") {
+    // Exact uid match (substring matching is too noisy when filtering by uid;
+    // e.g. "10" would also match uids 100, 101, …, 109).
     const q = (fs.uid || "").trim();
     for (const r of dataRows) {
       // uid is column index 1 (rank | uid | avg100 | emission | RMSE | RT).
       const uidText = (r.cells[1]?.textContent || "").trim();
-      const match = !q || uidText.includes(q);
+      const match = !q || uidText === q;
       r.classList.toggle("filtered-out", !match);
     }
   } else {
